@@ -121,7 +121,15 @@ SYSTEM_PROMPT = (
     "style, preference tags).\n\n"
     "OUTPUT: constraints and weights\n"
     "- `constraints`: one entry per attribute the conversation has "
-    "actually established, using the allowed attribute names below.\n"
+    "actually established, using ONLY the allowed attribute names below "
+    "as keys -- never invent a new key (e.g. write \"material\", not "
+    "\"band\" or \"fabric_type\"); an invented key is silently discarded "
+    "downstream.\n"
+    "- If the customer states what they're looking for up front (e.g. "
+    "\"I'm looking for X\"), that X is almost always the `category` -- "
+    "capture it as a constraint immediately, weight 0.8-1.0, even before "
+    "any question has been asked. Do not leave `constraints` empty when "
+    "the opening message already names what's being shopped for.\n"
     "- For material, color, size, style, and brand, prefer a single "
     "common canonical word (e.g. material: cotton, leather, polyester, "
     "wool, denim, silk, metal, alloy; color: black, white, blue, red, "
@@ -258,6 +266,11 @@ class SessionState:
             self.override_seen = True
             self.disclosed.clear()
             self.declined.clear()  # a new intent may reopen previously-declined attributes
+            # The override's own content is the single most important thing
+            # in it -- without this it was only visible on the turn it was
+            # said (relying on the LLM re-noticing it in the raw transcript
+            # every turn after, which it did not do reliably in testing).
+            self.disclosed["override"] = message
         elif self.last_asked:
             if NO_PREFERENCE_RE.search(message):
                 self.declined.add(self.last_asked)
@@ -271,9 +284,15 @@ class SessionState:
         self.agent_messages.append(message)
 
     def query_text(self) -> str:
-        # Full turn history, not just the latest message: this is what makes
-        # retrieval "remember" constraints revealed several turns ago.
-        return " ".join(self.messages)
+        # Built from genuinely informative content only: the opening
+        # message (always carries the base intent/category) plus every
+        # real disclosed value. NOT the full raw transcript -- that fills
+        # up with boilerplate ("I don't have an additional preference for
+        # X") which BM25 can actually over-weight, since such phrasing is
+        # rare in a product-catalog corpus and so looks "distinctive" to it.
+        parts = [self.messages[0]] if self.messages else []
+        parts.extend(self.disclosed.values())
+        return " ".join(parts)
 
 
 @dataclass
@@ -293,14 +312,21 @@ class InstructionSheet:
         if not isinstance(data, dict):
             raise ValueError("instruction sheet must be a JSON object")
 
+        # Only accept keys from the allowed attribute vocabulary. An
+        # invented key (seen in testing: "band" instead of "material")
+        # would otherwise silently skip structured-attribute matching and
+        # fall back to weaker raw-text search for no good reason -- ask_attribute
+        # was already validated this way, constraints/weights were not.
         constraints = {
             str(key): str(value)
             for key, value in (data.get("constraints") or {}).items()
-            if value not in (None, "", [])
+            if str(key) in ALLOWED_ATTRIBUTES and value not in (None, "", [])
         }
 
         weights: dict[str, float] = {}
         for key, value in (data.get("weights") or {}).items():
+            if str(key) not in ALLOWED_ATTRIBUTES:
+                continue
             try:
                 weights[str(key)] = max(0.0, min(1.0, float(value)))
             except (TypeError, ValueError):
@@ -341,7 +367,11 @@ class Agent:
     MAX_TURNS = 10
     # Candidates scored by the executor. Kept independent of top_k (fixed
     # at 10 by the contract) so the LLM's weights have real room to rerank.
-    CANDIDATE_POOL_SIZE = 100
+    # Was 100 -- raised after finding real targets sitting at BM25 rank
+    # ~103 and ~284 in post-mortem testing. Cheap to raise now that the LLM
+    # never sees the candidate list (only aggregate stats), so this only
+    # costs a bit of our own retrieval/scoring compute, not prompt tokens.
+    CANDIDATE_POOL_SIZE = 300
     # How many dense-similarity hits to pull in on a Browsing turn, merged
     # with the keyword results before scoring.
     DENSE_CANDIDATE_SIZE = 60
@@ -726,10 +756,18 @@ class Agent:
             state.record_message(user_message, turn)
 
             track = self._route_intent(state, user_message)
-            candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
             if track == "browsing" and self._dense_ready:
+                # Reserve room for dense hits up front -- _merge_candidates
+                # fills from BM25 first, so if BM25's own limit were the
+                # full pool size it could fill every slot itself and leave
+                # zero room for dense candidates to ever get merged in
+                # (this was a real regression, found via testing).
+                bm25_limit = max(self.CANDIDATE_POOL_SIZE - self.DENSE_CANDIDATE_SIZE, self.DENSE_CANDIDATE_SIZE)
+                candidates = self._retrieve_candidates(state, bm25_limit)
                 dense_hits = self._dense_candidates(state.query_text(), self.DENSE_CANDIDATE_SIZE)
                 candidates = self._merge_candidates(candidates, dense_hits, self.CANDIDATE_POOL_SIZE)
+            else:
+                candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
 
             if not candidates:
                 message = "Tell me a bit more about what you're looking for."
