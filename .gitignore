@@ -1,0 +1,16 @@
+# Downloaded/generated data (see README: download from GitHub Release)
+catalog.jsonl.gz
+data/catalog.jsonl
+
+# Evaluator output
+results.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Env / secrets
+.env
+*.env
+.venv/
+venv/
