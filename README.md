@@ -66,6 +66,67 @@ where each of these lives in code):
 
 **Team contributions:** _fill in before final submission._
 
+### `JustinAttempt` branch: dense retrieval extended to the Buying track
+
+**What changed:** `starter/agent.py`'s dense-embedding merge was gated to
+`track == "browsing"` only -- Buying-track turns got pure BM25 keyword
+retrieval, on the assumption that a stated hard constraint gives keyword
+search enough to work with. Benchmarking against an alternative agent that
+merges dense hits on every ambiguous turn regardless of track showed this
+assumption was costing real hits. The fix is a one-line gate removal in
+`respond()`:
+
+```python
+# before
+if track == "browsing" and self._dense_ready:
+    ...
+# after
+if self._dense_ready:
+    ...
+```
+
+**Model used for this benchmark:** `qwen3.5:9b` (ranking/dialogue) +
+`qwen3-embedding:0.6b` (dense retrieval -- overrides the code's default
+`nomic-embed-text` via `OLLAMA_EMBED_MODEL=qwen3-embedding:0.6b`; on this
+hardware it benchmarked ~2.5-5x slower to embed than `nomic-embed-text`
+but scores meaningfully higher, MTEB(eng v2) 70.70 vs 62.28). Still $0
+cost, local Ollama only.
+
+**Benchmark** (stratified random 20-session sample drawn from the public
+set, not the full 200 -- see caveat below):
+
+| Metric | Original (Browsing-only dense) | This branch (dense on every track) |
+|---|---|---|
+| Hit Rate@10 | 0.70 | **0.95** |
+| MRR | 0.441 | **0.548** |
+| MTTC | 5.7 | **4.2** |
+| TechnicalScore | 0.588 | **0.7755** |
+
+5 of the original 6 misses on this sample were rescued, including one
+Intent Override session that missed under every agent variant tested that
+day -- `_route_intent` routes override messages to the Buying track, so
+Intent Override sessions were silently locked out of dense retrieval too,
+not just Buying ones.
+
+**Other changes tried on this branch and reverted** (kept here so nobody
+re-discovers the same dead ends): turn-budget-aware prompting (an explicit
+"prefer answering over asking with 3 or fewer turns left" rule) regressed
+to 0.666 -- the model didn't reliably follow it, and even violated its own
+pre-existing "don't re-ask a known attribute" rule in the same trace.
+Trimming the per-turn prompt's conversation replay to the last 3 turns
+(to cut `prompt_tokens`) regressed to 0.574 *and increased* total token
+usage -- lower hit rate meant more turns/calls per session overall, so a
+shorter prompt that converges slower ended up costing more in aggregate
+than a longer one that converges fast.
+
+**Caveat:** every number above is a single run on one 20-session random
+draw, not the full 200-session public set, and this model samples at
+non-zero temperature -- repeat runs of the *identical* code have shown
+real swings (e.g. MRR ±0.09 on an unrelated identical-config test earlier
+the same day). Directionally informative, not a final number. Re-running
+against the full public set, or several different random draws, before
+relying on these figures for submission is recommended.
+
 ---
 
 ## What You Receive

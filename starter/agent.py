@@ -1,3 +1,16 @@
+# FROZEN REFERENCE SNAPSHOT -- checkpoint after fix #1 (dense retrieval
+# extended to Buying-track turns, not just Browsing) from the team's
+# improve-the-groupmate's-baseline plan, 2026-08-29.
+# Benchmarked at hit_rate_at_10=0.95, mrr=0.548, mttc=4.2,
+# technical_score=0.7755 on the random 20-session sample
+# (data/public_set_sample20.jsonl) with qwen3.5:9b + qwen3-embedding:0.6b --
+# up from 0.588 for the original (see agent_original.py). Rescued 5 of 6
+# original misses, including the intent_override session (public_0096)
+# that missed under every variant tested that day.
+# Not imported by the evaluator. This IS also the live starter/agent.py at
+# the time of this snapshot; kept here as a checkpoint marker before
+# attempting fix #2 (turn-budget-aware prompting), so we can diff or roll
+# back to this exact point if that next change doesn't pan out.
 from __future__ import annotations
 
 import json
@@ -250,7 +263,7 @@ class Agent:
         self._build_index()
 
         self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        self.model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+        self.model = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
         self.embed_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
         self.llm_timeout = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
         self._llm_failures = 0
@@ -504,6 +517,12 @@ class Agent:
                 "stream": False,
                 "format": "json",
                 "options": {"temperature": 0.2, "num_ctx": 4096},
+                # qwen3.5 defaults to emitting a "thinking" trace that can
+                # eat the whole output budget before ever reaching the
+                # answer, leaving message.content empty -- confirmed during
+                # earlier local testing today. Not needed for this
+                # structured-JSON task.
+                "think": False,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -589,7 +608,15 @@ class Agent:
 
             track = self._route_intent(state, user_message)
             candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
-            if track == "browsing" and self._dense_ready:
+            # Dense retrieval used to be Browsing-only, on the assumption
+            # Buying turns already have enough keyword signal. Benchmarking
+            # against a hybrid agent that merges dense hits on every
+            # ambiguous turn (regardless of track) showed this restriction
+            # was actually costing hits: several Buying sessions missed on
+            # pure keyword retrieval alone (e.g. a stated material/feature
+            # phrased differently than the catalog text) that dense
+            # retrieval recovers. Merge on both tracks now.
+            if self._dense_ready:
                 dense_hits = self._dense_candidates(state.query_text(), self.DENSE_CANDIDATE_SIZE)
                 candidates = self._merge_candidates(candidates, dense_hits, self.CANDIDATE_POOL_SIZE)
 
