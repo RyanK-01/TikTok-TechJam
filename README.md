@@ -15,7 +15,11 @@ before the original instructions.
 (structured constraints + per-attribute weights + an optional clarifying
 question) -> a deterministic, code-side executor that scores/ranks
 candidates and enforces the contract (valid IDs only, deduped, capped at
-`top_k`). Full architecture detail, setup steps, and tuning knobs live in
+`top_k`). The LLM never sees product data -- only the conversation, known
+constraints, and a cheap aggregate pool summary; all catalog matching runs
+against a structured attribute index (material/color/brand/style/size)
+extracted from the catalog once at load time, not raw text search. Full
+architecture detail, setup steps, and tuning knobs live in
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) -- read that before changing
 `starter/agent.py`.
 
@@ -48,14 +52,19 @@ graded in a network-restricted environment with no Ollama installed.
 | MRR | 0.068 | see `results.json` |
 | MTTC | 9.81 | see `results.json` |
 
-A 20-session scenario-balanced slice (`data/dev_slice.jsonl`) scored Hit
-Rate@10 `0.45`, MRR `0.32`, MTTC `7.4` -- small sample, noisy, but directionally
-consistent with the full run.
+A 20-session scenario-balanced slice (`data/dev_slice.jsonl`) currently scores
+Hit Rate@10 `0.80`, MRR `0.48`, MTTC `6.9` (up from `0.45`/`0.32`/`7.4` before
+the structured-attribute-index + product-data-free-prompt redesign) -- small
+sample, noisy, not yet confirmed against the full 200-session set.
 
 **Known limitations / open work** (see `docs/DEVELOPMENT.md` for exactly
 where each of these lives in code):
-- `SYSTEM_PROMPT` is a first draft, not yet tuned -- the single biggest
-  remaining accuracy lever.
+- `SYSTEM_PROMPT` has had one structural rewrite (product-data-free,
+  canonical-vocabulary-aware) but is still untuned beyond that -- still the
+  single biggest remaining accuracy lever.
+- Intent Override dipped on the latest dev-slice run (2/3 -> 1/3) alongside
+  the big Buying/Browsing gains -- worth watching on a larger sample before
+  concluding it's a real regression rather than slice noise.
 - `user_profile` is stored per session but not yet used to influence
   ranking -- personalization pillar is still open.
 - The intent router, executor scoring weights, and retrieval pool sizes are

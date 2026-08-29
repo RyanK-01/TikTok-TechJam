@@ -42,9 +42,51 @@ NO_PREFERENCE_RE = re.compile(r"don't have (?:an? )?(?:additional )?preference|n
 # non-empty disclosed-constraints dict) is treated as "the customer has
 # given us something concrete" -> Buying track. Their absence -> Browsing.
 BUDGET_RE = re.compile(r"\$\s?\d|\bunder\b|\bbudget\b|\bless than\b|\bcheap\b", re.IGNORECASE)
-MATERIAL_WORDS = {"cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric", "denim", "suede"}
-COLOR_WORDS = {"black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey", "purple", "yellow", "orange", "navy", "beige"}
-SIZE_WORDS = {"small", "medium", "large", "size", "xl", "xs", "wide", "narrow", "petite", "tall"}
+
+# Canonical, single-word vocabulary used two ways: (1) routing signal
+# (presence in the customer's message), and (2) structured per-product
+# attribute extraction at catalog-index time (see _extract_attrs). Sourced
+# from a scan of the real catalog's `details.Material`/`details.Color`
+# values, not guessed -- see docs/DEVELOPMENT.md.
+MATERIAL_WORDS = {
+    "cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon",
+    "fabric", "denim", "suede", "metal", "steel", "plastic", "synthetic", "wood",
+    "silicone", "crystal", "glass", "gemstone", "rubber", "stone", "vinyl", "brass",
+    "rhinestone", "alloy", "acrylic", "neoprene", "canvas", "mesh", "velvet", "satin",
+    "chiffon", "lace", "microfiber", "polyurethane", "viscose", "elastane", "lycra",
+    "cashmere", "fleece", "linen", "bamboo", "gold", "silver", "platinum", "titanium",
+    "copper", "zinc", "pearl", "diamond", "resin",
+}
+COLOR_WORDS = {
+    "black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey",
+    "purple", "yellow", "orange", "navy", "beige", "tan", "ivory", "cream", "khaki",
+    "maroon", "teal", "turquoise", "lavender", "coral", "mint", "burgundy", "charcoal",
+    "olive", "mustard", "multicolor",
+}
+SIZE_WORDS = {
+    "small", "medium", "large", "size", "xl", "xs", "xxl", "xxs", "wide", "narrow",
+    "petite", "tall", "regular", "plus",
+}
+STYLE_WORDS = {
+    "casual", "formal", "athletic", "vintage", "classic", "modern", "bohemian",
+    "sporty", "elegant", "minimalist", "streetwear", "business", "chic",
+}
+# Multi-word canonical terms that single-token matching misses -- checked
+# via substring, kept short/high-value rather than exhaustive.
+MATERIAL_PHRASES = {"faux leather", "sterling silver", "stainless steel", "genuine leather"}
+COLOR_PHRASES = {"rose gold"}
+SIZE_PHRASES = {"one size", "plus size"}
+
+# Where a product's raw `details` dict already carries a clean attribute,
+# prefer it outright over vocabulary-matching free text.
+DETAIL_ATTR_MAP = {
+    "material": ("Material", "Fabric Type"),
+    "color": ("Color",),
+    "brand": ("Brand", "Brand Name"),
+    "style": ("Style", "Fit Type", "Pattern", "Closure Type"),
+    "size": ("Size",),
+}
+STRUCTURED_ATTRIBUTES = frozenset(DETAIL_ATTR_MAP.keys())
 
 CATALOG_COLUMNS = ("parent_asin", "title", "categories", "features", "details", "store", "description")
 
@@ -54,27 +96,61 @@ ALLOWED_ATTRIBUTES = frozenset({
 })
 
 SYSTEM_PROMPT = (
-    "You are the ranking assistant inside a shopping agent for an Amazon "
-    "Clothing/Shoes/Jewelry catalog. Each turn you receive the conversation "
-    "so far, what the customer has already told us, a detected Buying/"
-    "Browsing track, and a sample of currently-matching products. Output "
-    "ONE JSON object describing how to filter and rank the full candidate "
-    "pool -- you do not pick products directly, and you never see full "
-    "product IDs.\n\n"
-    "Rules:\n"
-    "- Use only the allowed attribute names below.\n"
-    "- On a BUYING turn, favor fewer, higher-confidence constraints (the "
-    "customer has told us something concrete -- lock onto it).\n"
-    "- On a BROWSING turn, the candidate pool is more varied by design; "
-    "favor asking a clarifying question unless one option is clearly "
-    "strongest.\n"
-    "- If the product sample still looks broad or mixed after applying "
-    "known constraints, set ask_attribute to the single most useful thing "
-    "to learn next. Otherwise set it to null.\n"
-    "- Never ask about an attribute already present in \"Known constraints "
-    "so far\".\n"
-    "- Respond with JSON only, matching the schema exactly. No prose, no "
-    "markdown fences.\n\n"
+    "ROLE\n"
+    "You are the sole language-understanding component of a shopping agent "
+    "for an Amazon Clothing/Shoes/Jewelry catalog. Your only job is to read "
+    "the customer's full conversation and turn it into one structured "
+    "instruction sheet. You never see any product data -- not a title, not "
+    "an ID, nothing. All catalog interaction (retrieval, filtering, "
+    "ranking) is handled by deterministic code downstream using exactly "
+    "what you output. Put your full attention into understanding the "
+    "customer, not into guessing about products.\n\n"
+    "WHAT YOU RECEIVE EACH TURN\n"
+    "- The complete conversation so far (every customer message and every "
+    "agent reply/question) -- always use all of it, not just the latest "
+    "message; earlier turns often carry constraints that still apply.\n"
+    "- Known constraints already disclosed, and attributes the customer "
+    "explicitly has no preference for (never ask about those again).\n"
+    "- Attributes not yet explored -- prefer asking about one of these "
+    "over anything already disclosed or declined.\n"
+    "- A detected BUYING or BROWSING track for this turn.\n"
+    "- A one-line summary of the current candidate pool (count, price "
+    "range, category spread) -- for calibrating breadth only, not for "
+    "picking or reasoning about individual products.\n"
+    "- The customer's aggregate profile (purchase history summary, rating "
+    "style, preference tags).\n\n"
+    "OUTPUT: constraints and weights\n"
+    "- `constraints`: one entry per attribute the conversation has "
+    "actually established, using the allowed attribute names below.\n"
+    "- For material, color, size, style, and brand, prefer a single "
+    "common canonical word (e.g. material: cotton, leather, polyester, "
+    "wool, denim, silk, metal, alloy; color: black, white, blue, red, "
+    "green, brown, gray, navy; size: small, medium, large, xl, xs) over "
+    "a paraphrase -- these values are matched against catalog data "
+    "automatically, so exact, ordinary wording matters more than "
+    "elegant phrasing.\n"
+    "- For budget, extract a plain number (e.g. \"80\" for \"under $80\").\n"
+    "- `weights`: 0.0-1.0 per constraint, reflecting how confident/"
+    "important that signal is. On a BUYING turn, the customer gave "
+    "something concrete -- weight it high (0.7-1.0). On a BROWSING turn, "
+    "signals are softer -- weight 0.3-0.6 unless clearly stated.\n\n"
+    "OUTPUT: ask_attribute\n"
+    "- If the pool summary still looks broad (a high count, or a wide "
+    "price/category spread) relative to what's been disclosed, set "
+    "ask_attribute to the single most useful attribute to learn next -- "
+    "prefer one from \"attributes not yet explored\". Otherwise set it to "
+    "null and let the ranking stand.\n"
+    "- Never set ask_attribute to something already disclosed or "
+    "declined -- pick a genuinely new one, or null.\n"
+    "- If the customer says to use their judgment on something, treat "
+    "that the same as a decline: do not ask about it again.\n\n"
+    "OUTPUT: message\n"
+    "- One short, natural, customer-facing sentence. If ask_attribute is "
+    "set, phrase it as that question. If null, briefly acknowledge you're "
+    "showing results.\n\n"
+    "FORMAT\n"
+    "Respond with JSON only, matching the schema exactly. No prose, no "
+    "markdown fences, no explanation outside the JSON object.\n\n"
     "Allowed ask_attribute values: " + ", ".join(sorted(ALLOWED_ATTRIBUTES)) + ", or null.\n\n"
     "Schema:\n"
     "{\n"
@@ -102,6 +178,43 @@ def _terms(text: str) -> list[str]:
         for token in TOKEN_RE.findall(text)
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
+
+
+def _extract_attrs(product: dict) -> dict[str, set[str]]:
+    """Structured, canonical attributes for one catalog product -- built
+    once at index time so the executor can match an instruction sheet's
+    constraint values against clean data instead of raw text search.
+    `details` dict values (when present) are the most reliable source and
+    are preferred outright; vocabulary matching over title/features/
+    description fills in the rest.
+    """
+    attrs: dict[str, set[str]] = {name: set() for name in STRUCTURED_ATTRIBUTES}
+
+    details = product.get("details")
+    if isinstance(details, dict):
+        for attr, keys in DETAIL_ATTR_MAP.items():
+            for key in keys:
+                value = details.get(key)
+                if value:
+                    attrs[attr].add(str(value).strip().lower())
+
+    store = product.get("store")
+    if store:
+        attrs["brand"].add(str(store).strip().lower())
+
+    text_blob = " ".join(
+        [str(product.get("title") or ""), _text(product.get("features")), _text(product.get("description"))]
+    ).lower()
+    terms = set(_terms(text_blob))
+    attrs["material"] |= terms & MATERIAL_WORDS
+    attrs["color"] |= terms & COLOR_WORDS
+    attrs["size"] |= terms & SIZE_WORDS
+    attrs["style"] |= terms & STYLE_WORDS
+    attrs["material"] |= {phrase for phrase in MATERIAL_PHRASES if phrase in text_blob}
+    attrs["color"] |= {phrase for phrase in COLOR_PHRASES if phrase in text_blob}
+    attrs["size"] |= {phrase for phrase in SIZE_PHRASES if phrase in text_blob}
+
+    return attrs
 
 
 def _as_float(value: object) -> float | None:
@@ -229,9 +342,6 @@ class Agent:
     # Candidates scored by the executor. Kept independent of top_k (fixed
     # at 10 by the contract) so the LLM's weights have real room to rerank.
     CANDIDATE_POOL_SIZE = 100
-    # Candidates actually shown to the LLM in the prompt -- kept small to
-    # fit Ollama's default 4096-token context alongside conversation history.
-    CANDIDATE_SAMPLE_SIZE = 18
     # How many dense-similarity hits to pull in on a Browsing turn, merged
     # with the keyword results before scoring.
     DENSE_CANDIDATE_SIZE = 60
@@ -285,6 +395,7 @@ class Agent:
                     "description": _text(product.get("description")),
                     "price": _as_float(product.get("price")),
                     "average_rating": _as_float(product.get("average_rating")),
+                    "attrs": _extract_attrs(product),
                 }
                 self._products[parent_asin] = fields
                 batch.append(tuple(fields[column] for column in CATALOG_COLUMNS))
@@ -443,14 +554,28 @@ class Agent:
 
     # ---- Stage 2: LLM instruction sheet ---------------------------------
 
-    def _summarize_candidate(self, candidate: dict) -> str:
-        title = (candidate.get("title") or "product").strip()
-        if len(title) > 70:
-            title = title[:67].rstrip() + "..."
-        price = candidate.get("price")
-        price_text = f"${price:.2f}" if isinstance(price, float) else "price n/a"
-        categories = " ".join((candidate.get("categories") or "").split()[:6])
-        return f'"{title}" | {price_text} | {categories}'.strip()
+    @staticmethod
+    def _pool_summary(candidates: list[dict]) -> str:
+        """A cheap, aggregate description of the current candidate pool --
+        count, price range, category spread. This is deliberately NOT a
+        product list: the LLM gets just enough signal to judge whether the
+        pool is still broad (and so whether to ask a clarifying question),
+        without ever seeing product data. Computed from data already in
+        memory, no extra retrieval cost."""
+        if not candidates:
+            return "No products currently match."
+        prices = [c["price"] for c in candidates if isinstance(c.get("price"), float)]
+        price_range = f"${min(prices):.0f}-${max(prices):.0f}" if prices else "unknown"
+        category_counts: dict[str, int] = {}
+        excluded = {"clothing", "shoes & jewelry", "clothing, shoes & jewelry"}
+        for candidate in candidates:
+            for part in (candidate.get("categories") or "").split(","):
+                part = part.strip()
+                if part and part.lower() not in excluded:
+                    category_counts[part] = category_counts.get(part, 0) + 1
+        top_categories = sorted(category_counts.items(), key=lambda item: -item[1])[:5]
+        spread = ", ".join(name for name, _ in top_categories) or "mixed"
+        return f"{len(candidates)} products currently match. Price range: {price_range}. Category spread: {spread}."
 
     def _build_user_prompt(self, state: SessionState, candidates: list[dict], track: str) -> str:
         profile = state.profile or {}
@@ -488,11 +613,10 @@ class Agent:
                 "Customer has NO preference for these -- do not ask again: "
                 + ", ".join(sorted(state.declined))
             )
+        remaining = sorted(ALLOWED_ATTRIBUTES - set(state.disclosed) - state.declined)
+        lines.append("Attributes not yet explored (prefer these for ask_attribute): " + ", ".join(remaining))
         lines.append("")
-        sample = candidates[: self.CANDIDATE_SAMPLE_SIZE]
-        lines.append(f"Sample of currently-matching products ({len(candidates)} total, showing {len(sample)}):")
-        for candidate in sample:
-            lines.append(f"- {self._summarize_candidate(candidate)}")
+        lines.append("Candidate pool: " + self._pool_summary(candidates))
         lines.append("")
         lines.append("Return the JSON instruction sheet now.")
         return "\n".join(lines)
@@ -545,20 +669,34 @@ class Agent:
     def _score_candidates(self, candidates: list[dict], sheet: InstructionSheet) -> list[str]:
         scored: list[tuple[float, int, str]] = []
         for rank, candidate in enumerate(candidates):
-            combined_text = " ".join(
-                candidate.get(field_name, "") for field_name in CATALOG_COLUMNS[1:]
-            ).lower()
+            combined_text = None  # built lazily -- only needed for the raw-text fallback path
+            attrs = candidate.get("attrs") or {}
 
             score = 0.0
             for attribute, value in sheet.constraints.items():
                 weight = sheet.weights.get(attribute, 0.5)
+                lowered_value = value.lower()
                 if attribute == "budget":
                     budget_max = _as_float(value)
                     price = candidate.get("price")
                     if budget_max is not None and price is not None and price <= budget_max:
                         score += weight
-                elif value.lower() in combined_text:
-                    score += weight
+                elif attribute in STRUCTURED_ATTRIBUTES and attrs.get(attribute):
+                    # Structured match against clean, canonicalized product
+                    # data instead of raw text -- substring-safe both ways
+                    # so "gold" still matches a stored "rose gold".
+                    if any(lowered_value in term or term in lowered_value for term in attrs[attribute]):
+                        score += weight
+                elif attribute == "category":
+                    if lowered_value in (candidate.get("categories") or "").lower():
+                        score += weight
+                else:
+                    if combined_text is None:
+                        combined_text = " ".join(
+                            candidate.get(field_name, "") for field_name in CATALOG_COLUMNS[1:]
+                        ).lower()
+                    if lowered_value in combined_text:
+                        score += weight
             # Tie-break toward the original retrieval order so an empty/
             # failed instruction sheet degrades to plain retrieval, not a
             # shuffle.
