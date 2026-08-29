@@ -4,9 +4,18 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import numpy as np
+
+    _NUMPY_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment without numpy
+    np = None  # type: ignore[assignment]
+    _NUMPY_AVAILABLE = False
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -23,6 +32,20 @@ STOPWORDS = {
 # holds even when one constraint changes.
 OVERRIDE_RE = re.compile(r"\bignore\b.*\b(earlier|previous)\b", re.IGNORECASE)
 
+# A reply that declines to give a preference ("I don't have a preference
+# for X") is not a disclosed value -- it must not be stored as one, or the
+# agent (a) thinks it has real info to act on and (b) keeps re-asking the
+# same attribute because nothing ever looks "already answered".
+NO_PREFERENCE_RE = re.compile(r"don't have (?:an? )?(?:additional )?preference|no preference", re.IGNORECASE)
+
+# Router signals: presence of any of these in a message (or an already
+# non-empty disclosed-constraints dict) is treated as "the customer has
+# given us something concrete" -> Buying track. Their absence -> Browsing.
+BUDGET_RE = re.compile(r"\$\s?\d|\bunder\b|\bbudget\b|\bless than\b|\bcheap\b", re.IGNORECASE)
+MATERIAL_WORDS = {"cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric", "denim", "suede"}
+COLOR_WORDS = {"black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey", "purple", "yellow", "orange", "navy", "beige"}
+SIZE_WORDS = {"small", "medium", "large", "size", "xl", "xs", "wide", "narrow", "petite", "tall"}
+
 CATALOG_COLUMNS = ("parent_asin", "title", "categories", "features", "details", "store", "description")
 
 ALLOWED_ATTRIBUTES = frozenset({
@@ -33,12 +56,18 @@ ALLOWED_ATTRIBUTES = frozenset({
 SYSTEM_PROMPT = (
     "You are the ranking assistant inside a shopping agent for an Amazon "
     "Clothing/Shoes/Jewelry catalog. Each turn you receive the conversation "
-    "so far, what the customer has already told us, and a sample of "
-    "currently-matching products. Output ONE JSON object describing how to "
-    "filter and rank the full candidate pool -- you do not pick products "
-    "directly, and you never see full product IDs.\n\n"
+    "so far, what the customer has already told us, a detected Buying/"
+    "Browsing track, and a sample of currently-matching products. Output "
+    "ONE JSON object describing how to filter and rank the full candidate "
+    "pool -- you do not pick products directly, and you never see full "
+    "product IDs.\n\n"
     "Rules:\n"
     "- Use only the allowed attribute names below.\n"
+    "- On a BUYING turn, favor fewer, higher-confidence constraints (the "
+    "customer has told us something concrete -- lock onto it).\n"
+    "- On a BROWSING turn, the candidate pool is more varied by design; "
+    "favor asking a clarifying question unless one option is clearly "
+    "strongest.\n"
     "- If the product sample still looks broad or mixed after applying "
     "known constraints, set ask_attribute to the single most useful thing "
     "to learn next. Otherwise set it to null.\n"
@@ -104,6 +133,9 @@ class SessionState:
     # attribute -> the reply text that answered it (assumed to answer
     # whichever attribute we last asked about)
     disclosed: dict[str, str] = field(default_factory=dict)
+    # attributes the customer explicitly has no preference for -- distinct
+    # from disclosed (there's no value here, just "don't ask again")
+    declined: set[str] = field(default_factory=set)
     last_asked: str | None = None
     override_seen: bool = False
 
@@ -112,8 +144,12 @@ class SessionState:
         if OVERRIDE_RE.search(message):
             self.override_seen = True
             self.disclosed.clear()
+            self.declined.clear()  # a new intent may reopen previously-declined attributes
         elif self.last_asked:
-            self.disclosed[self.last_asked] = message
+            if NO_PREFERENCE_RE.search(message):
+                self.declined.add(self.last_asked)
+            else:
+                self.disclosed[self.last_asked] = message
         self.messages.append(message)
 
     def record_turn_result(self, ask_attribute: str | None, message: str) -> None:
@@ -178,14 +214,14 @@ class InstructionSheet:
 
 
 class Agent:
-    """Retrieval -> LLM instruction sheet -> deterministic execution.
+    """Dual-track retrieval -> LLM instruction sheet -> deterministic execution.
 
-    Pipeline per turn: update SessionState -> retrieve a candidate pool from
-    the catalog using everything known so far -> ask a local LLM (via
-    Ollama) for a small JSON "instruction sheet" (constraints + weights +
-    an optional clarifying question) -> apply that sheet to the candidates
-    deterministically -> return top_k. Any LLM failure (unreachable,
-    malformed output, timeout) falls back to the plain retrieval order
+    Pipeline per turn: update SessionState -> route the turn to a Buying
+    (precise keyword/filter) or Browsing (keyword + dense-embedding hybrid)
+    track -> ask a local LLM (via Ollama) for a small JSON "instruction
+    sheet" (constraints + weights + an optional clarifying question) ->
+    apply that sheet to the candidates deterministically -> return top_k.
+    Any LLM/embedding failure falls back to the plain retrieval order
     rather than raising.
     """
 
@@ -196,20 +232,36 @@ class Agent:
     # Candidates actually shown to the LLM in the prompt -- kept small to
     # fit Ollama's default 4096-token context alongside conversation history.
     CANDIDATE_SAMPLE_SIZE = 18
+    # How many dense-similarity hits to pull in on a Browsing turn, merged
+    # with the keyword results before scoring.
+    DENSE_CANDIDATE_SIZE = 60
     LLM_FAILURE_THRESHOLD = 3
+
+    EMBED_BATCH_SIZE = 250
+    EMBED_MAX_CHARS = 600
+    EMBEDDINGS_PATH = Path("data/embeddings.npy")
+    EMBEDDING_IDS_PATH = Path("data/embeddings_ids.json")
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, SessionState] = {}
-        self._meta: dict[str, dict] = {}
+        self._products: dict[str, dict] = {}
         self._build_index()
 
         self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         self.model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+        self.embed_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
         self.llm_timeout = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
         self._llm_failures = 0
         self._llm_disabled = False
+        self._dense_failures = 0
+        self._dense_disabled = False
+
+        self._embedding_matrix = None
+        self._embedding_ids: list[str] = []
+        self._dense_ready = False
+        self._ensure_embeddings()
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -223,21 +275,19 @@ class Agent:
             for line in handle:
                 product = json.loads(line)
                 parent_asin = str(product["parent_asin"])
-                self._meta[parent_asin] = {
+                fields = {
+                    "parent_asin": parent_asin,
+                    "title": _text(product.get("title")),
+                    "categories": _text(product.get("categories")),
+                    "features": _text(product.get("features")),
+                    "details": _text(product.get("details")),
+                    "store": _text(product.get("store")),
+                    "description": _text(product.get("description")),
                     "price": _as_float(product.get("price")),
                     "average_rating": _as_float(product.get("average_rating")),
                 }
-                batch.append(
-                    (
-                        parent_asin,
-                        _text(product.get("title")),
-                        _text(product.get("categories")),
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
-                    )
-                )
+                self._products[parent_asin] = fields
+                batch.append(tuple(fields[column] for column in CATALOG_COLUMNS))
                 if len(batch) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                     batch.clear()
@@ -248,7 +298,24 @@ class Agent:
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = SessionState(profile=user_profile)
 
-    # ---- Stage 1: cheap retrieval -----------------------------------
+    # ---- Intent routing ------------------------------------------------
+
+    def _route_intent(self, state: SessionState, user_message: str) -> str:
+        """"buying" (precise) or "browsing" (exploratory), decided fresh
+        each turn -- a session can move from browsing to buying as the
+        customer reveals concrete constraints."""
+        if OVERRIDE_RE.search(user_message):
+            return "buying"  # a replaced preference is still a hard constraint
+        if BUDGET_RE.search(user_message):
+            return "buying"
+        message_terms = set(_terms(user_message))
+        if message_terms & (MATERIAL_WORDS | COLOR_WORDS | SIZE_WORDS):
+            return "buying"
+        if state.disclosed:
+            return "buying"
+        return "browsing"
+
+    # ---- Stage 1a: cheap keyword retrieval -----------------------------
 
     def _retrieve_candidates(self, state: SessionState, limit: int) -> list[dict]:
         unique_terms = list(dict.fromkeys(_terms(state.query_text())))[:40]
@@ -256,28 +323,148 @@ class Agent:
         if not expression:
             return []
         rows = self.connection.execute(
-            "SELECT parent_asin, title, categories, features, details, store, description "
-            "FROM products WHERE products MATCH ? "
+            "SELECT parent_asin FROM products WHERE products MATCH ? "
             "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
             (expression, limit),
         ).fetchall()
-        return [dict(zip(CATALOG_COLUMNS, row)) for row in rows]
+        # Look up the full record (incl. price/rating, which the FTS table
+        # itself doesn't carry) instead of rebuilding a partial dict from
+        # the SQL row -- self._products is the single source of truth.
+        return [self._products[row[0]] for row in rows if row[0] in self._products]
 
-    # ---- Stage 2: LLM instruction sheet ------------------------------
+    # ---- Stage 1b: dense/embedding retrieval (Browsing track) ----------
+
+    def _embedding_text(self, product: dict) -> str:
+        parts = [product.get(field_name, "") for field_name in ("title", "categories", "features", "description")]
+        combined = " ".join(part for part in parts if part).strip()
+        return (combined or product.get("title") or "product")[: self.EMBED_MAX_CHARS]
+
+    def _embed_batch(self, texts: list[str], attempts: int = 3) -> list[list[float]]:
+        payload = json.dumps({"model": self.embed_model, "input": texts}).encode("utf-8")
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            request = urllib.request.Request(
+                f"{self.ollama_host}/api/embed",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=max(60.0, self.llm_timeout)) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                return body["embeddings"]
+            except Exception as exc:  # transient Ollama/GPU hiccups do happen mid-batch
+                last_error = exc
+                if attempt < attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+        raise last_error  # type: ignore[misc]
+
+    def _build_embeddings(self) -> None:
+        parent_asins = list(self._products.keys())
+        total = len(parent_asins)
+        eta_minutes = total * 0.03 / 60
+        print(f"[agent] building embedding index for {total} products (one-time, ~{eta_minutes:.0f} min)...")
+        vectors: list[list[float]] = []
+        for start in range(0, total, self.EMBED_BATCH_SIZE):
+            batch_ids = parent_asins[start : start + self.EMBED_BATCH_SIZE]
+            batch_texts = [self._embedding_text(self._products[pid]) for pid in batch_ids]
+            vectors.extend(self._embed_batch(batch_texts))
+            done = start + len(batch_ids)
+            print(f"[agent]   {done}/{total} ({100 * done / total:.1f}%)", flush=True)
+
+        matrix = np.array(vectors, dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        matrix = matrix / norms
+
+        self.EMBEDDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        np.save(self.EMBEDDINGS_PATH, matrix)
+        self.EMBEDDING_IDS_PATH.write_text(json.dumps(parent_asins), encoding="utf-8")
+
+        self._embedding_matrix = matrix
+        self._embedding_ids = parent_asins
+        self._dense_ready = True
+        print(f"[agent] embedding index ready: {matrix.shape}")
+
+    def _ensure_embeddings(self) -> None:
+        if not _NUMPY_AVAILABLE:
+            print("[agent] numpy not available -- dense retrieval disabled, Browsing falls back to keyword search.")
+            return
+        try:
+            if self.EMBEDDINGS_PATH.exists() and self.EMBEDDING_IDS_PATH.exists():
+                ids = json.loads(self.EMBEDDING_IDS_PATH.read_text(encoding="utf-8"))
+                matrix = np.load(self.EMBEDDINGS_PATH)
+                if len(ids) == matrix.shape[0] == len(self._products):
+                    self._embedding_matrix = matrix
+                    self._embedding_ids = ids
+                    self._dense_ready = True
+                    return
+                print("[agent] cached embeddings don't match the current catalog -- rebuilding.")
+            self._build_embeddings()
+        except Exception as exc:
+            print(f"[agent] dense retrieval unavailable ({exc}) -- Browsing falls back to keyword search.")
+
+    def _dense_candidates(self, query_text: str, limit: int) -> list[dict]:
+        if not self._dense_ready or self._dense_disabled or not query_text.strip():
+            return []
+        try:
+            vectors = self._embed_batch([query_text[: self.EMBED_MAX_CHARS]], attempts=1)
+            vector = np.array(vectors[0], dtype=np.float32)
+            norm = np.linalg.norm(vector)
+            if not norm:
+                return []
+            vector = vector / norm
+            self._dense_failures = 0
+        except Exception:
+            self._dense_failures += 1
+            if self._dense_failures >= self.LLM_FAILURE_THRESHOLD:
+                self._dense_disabled = True
+            return []
+
+        scores = self._embedding_matrix @ vector
+        k = min(limit, scores.shape[0])
+        top_indices = np.argpartition(-scores, k - 1)[:k]
+        top_indices = top_indices[np.argsort(-scores[top_indices])]
+        return [self._products[self._embedding_ids[i]] for i in top_indices]
+
+    @staticmethod
+    def _merge_candidates(primary: list[dict], secondary: list[dict], limit: int) -> list[dict]:
+        seen: set[str] = set()
+        merged: list[dict] = []
+        for group in (primary, secondary):
+            for candidate in group:
+                parent_asin = candidate["parent_asin"]
+                if parent_asin in seen:
+                    continue
+                seen.add(parent_asin)
+                merged.append(candidate)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    # ---- Stage 2: LLM instruction sheet ---------------------------------
 
     def _summarize_candidate(self, candidate: dict) -> str:
         title = (candidate.get("title") or "product").strip()
         if len(title) > 70:
             title = title[:67].rstrip() + "..."
-        price = self._meta.get(candidate["parent_asin"], {}).get("price")
+        price = candidate.get("price")
         price_text = f"${price:.2f}" if isinstance(price, float) else "price n/a"
         categories = " ".join((candidate.get("categories") or "").split()[:6])
         return f'"{title}" | {price_text} | {categories}'.strip()
 
-    def _build_user_prompt(self, state: SessionState, candidates: list[dict]) -> str:
+    def _build_user_prompt(self, state: SessionState, candidates: list[dict], track: str) -> str:
         profile = state.profile or {}
+        track_note = (
+            "Detected track: BUYING -- the customer has given something concrete; "
+            "prioritize precision and lock in hard constraints."
+            if track == "buying"
+            else "Detected track: BROWSING -- the customer is still exploring; the "
+            "candidate pool is broader by design, favor a clarifying question "
+            "unless one option is clearly strongest."
+        )
         lines = [
             f"Turn {state.turn} of {self.MAX_TURNS}.",
+            track_note,
             "Customer profile: "
             f"purchase_frequency={profile.get('purchase_frequency', 'unknown')}, "
             f"rating_style={profile.get('rating_style', 'unknown')}, "
@@ -296,6 +483,11 @@ class Agent:
         lines.append(
             "Known constraints so far: " + (json.dumps(state.disclosed) if state.disclosed else "none yet")
         )
+        if state.declined:
+            lines.append(
+                "Customer has NO preference for these -- do not ask again: "
+                + ", ".join(sorted(state.declined))
+            )
         lines.append("")
         sample = candidates[: self.CANDIDATE_SAMPLE_SIZE]
         lines.append(f"Sample of currently-matching products ({len(candidates)} total, showing {len(sample)}):")
@@ -327,15 +519,15 @@ class Agent:
             body = json.loads(response.read().decode("utf-8"))
         content = body.get("message", {}).get("content", "")
         usage = {
-            "prompt_tokens": int(body.get("prompt_eval_count") or 0),
-            "completion_tokens": int(body.get("eval_count") or 0),
+            "prompt_tokens": max(0, int(body.get("prompt_eval_count") or 0)),
+            "completion_tokens": max(0, int(body.get("eval_count") or 0)),
         }
         return content, usage
 
-    def _get_instruction_sheet(self, state: SessionState, candidates: list[dict]) -> InstructionSheet:
+    def _get_instruction_sheet(self, state: SessionState, candidates: list[dict], track: str) -> InstructionSheet:
         if self._llm_disabled:
             return InstructionSheet.fallback()
-        user_prompt = self._build_user_prompt(state, candidates)
+        user_prompt = self._build_user_prompt(state, candidates, track)
         try:
             content, usage = self._call_ollama(SYSTEM_PROMPT, user_prompt)
             sheet = InstructionSheet.parse(content)
@@ -348,13 +540,11 @@ class Agent:
                 self._llm_disabled = True
             return InstructionSheet.fallback()
 
-    # ---- Stage 3: deterministic execution ----------------------------
+    # ---- Stage 3: deterministic execution -------------------------------
 
     def _score_candidates(self, candidates: list[dict], sheet: InstructionSheet) -> list[str]:
         scored: list[tuple[float, int, str]] = []
         for rank, candidate in enumerate(candidates):
-            parent_asin = candidate["parent_asin"]
-            meta = self._meta.get(parent_asin, {})
             combined_text = " ".join(
                 candidate.get(field_name, "") for field_name in CATALOG_COLUMNS[1:]
             ).lower()
@@ -364,15 +554,16 @@ class Agent:
                 weight = sheet.weights.get(attribute, 0.5)
                 if attribute == "budget":
                     budget_max = _as_float(value)
-                    price = meta.get("price")
+                    price = candidate.get("price")
                     if budget_max is not None and price is not None and price <= budget_max:
                         score += weight
                 elif value.lower() in combined_text:
                     score += weight
-            # Tie-break toward the original BM25 order so an empty/failed
-            # instruction sheet degrades to plain retrieval, not a shuffle.
+            # Tie-break toward the original retrieval order so an empty/
+            # failed instruction sheet degrades to plain retrieval, not a
+            # shuffle.
             score += 1.0 / (1 + rank) * 0.1
-            scored.append((score, rank, parent_asin))
+            scored.append((score, rank, candidate["parent_asin"]))
 
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [parent_asin for _, _, parent_asin in scored]
@@ -387,27 +578,53 @@ class Agent:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         state = self._sessions[session_id]
-        state.record_message(user_message, turn)
 
-        candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
-        if not candidates:
-            message = "Tell me a bit more about what you're looking for."
-            state.record_turn_result(None, message)
+        # Everything below touches retrieval/scoring/LLM logic that we own;
+        # the LLM and embedding calls already catch their own failures, but
+        # this is a last line of defense so a stray bug in our code still
+        # returns a valid, contract-shaped response instead of raising and
+        # counting the turn (or the whole session) as a hard miss.
+        try:
+            state.record_message(user_message, turn)
+
+            track = self._route_intent(state, user_message)
+            candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
+            if track == "browsing" and self._dense_ready:
+                dense_hits = self._dense_candidates(state.query_text(), self.DENSE_CANDIDATE_SIZE)
+                candidates = self._merge_candidates(candidates, dense_hits, self.CANDIDATE_POOL_SIZE)
+
+            if not candidates:
+                message = "Tell me a bit more about what you're looking for."
+                state.record_turn_result(None, message)
+                return {
+                    "message": message,
+                    "ask_attribute": None,
+                    "recommendations": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                }
+
+            sheet = self._get_instruction_sheet(state, candidates, track)
+            ranked_ids = self._score_candidates(candidates, sheet)[:top_k]
+            message = sheet.message or "Here are the closest matches I found."
+
+            # Hard enforcement, not just a prompt instruction: never re-ask
+            # an attribute the customer already said they have no
+            # preference for, regardless of what the LLM returned.
+            ask_attribute = sheet.ask_attribute
+            if ask_attribute in state.declined:
+                ask_attribute = None
+
+            state.record_turn_result(ask_attribute, message)
             return {
                 "message": message,
+                "ask_attribute": ask_attribute,
+                "recommendations": [{"parent_asin": pid} for pid in ranked_ids],
+                "usage": sheet.usage,
+            }
+        except Exception:
+            return {
+                "message": "Sorry, could you tell me more about what you're looking for?",
                 "ask_attribute": None,
                 "recommendations": [],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0},
             }
-
-        sheet = self._get_instruction_sheet(state, candidates)
-        ranked_ids = self._score_candidates(candidates, sheet)[:top_k]
-        message = sheet.message or "Here are the closest matches I found."
-
-        state.record_turn_result(sheet.ask_attribute, message)
-        return {
-            "message": message,
-            "ask_attribute": sheet.ask_attribute,
-            "recommendations": [{"parent_asin": pid} for pid in ranked_ids],
-            "usage": sheet.usage,
-        }
