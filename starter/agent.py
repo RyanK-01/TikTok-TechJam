@@ -167,6 +167,19 @@ class SessionState:
     declined: set[str] = field(default_factory=set)
     last_asked: str | None = None
     override_seen: bool = False
+    # Salient terms from the customer's very first message (see
+    # Agent._capture_category) -- captured once and never cleared, even
+    # across an Intent Override, on the same reasoning OVERRIDE_RE already
+    # uses above: the broad category ("running shoes") almost always
+    # survives a change to one constraint ("actually, make it black"),
+    # so it's worth anchoring retrieval + scoring on regardless of what
+    # else the customer revises later.
+    category_terms: list[str] = field(default_factory=list)
+    # The last successfully-scored ranking. Re-served (via
+    # Agent._ensure_top_k) if a later turn comes up short -- e.g. a retrieval
+    # miss or empty candidate pool -- so a transient failure never forces an
+    # empty/short response when we already had a decent guess on hand.
+    last_ranked: list[str] = field(default_factory=list)
 
     def record_message(self, message: str, turn: int) -> None:
         self.turn = turn
@@ -255,11 +268,22 @@ class Agent:
     """
 
     MAX_TURNS = 10
-    # Candidates scored by the executor. Kept independent of top_k (fixed
-    # at 10 by the contract) so the LLM's weights have real room to rerank.
-    CANDIDATE_POOL_SIZE = 100
+    # Candidates scored by the executor on a Buying turn. Kept independent of
+    # top_k (fixed at 10 by the contract) so the LLM's weights have real room
+    # to rerank. 100 was measured too shallow: a real match can sit well
+    # outside the top 100 by plain BM25/dense order and only surface once
+    # exact-constraint scoring re-ranks it -- but scoring can't rescue a
+    # candidate that retrieval already dropped.
+    CANDIDATE_POOL_SIZE = 400
+    # Browsing turns have no disclosed constraints yet, so the query is
+    # necessarily broader and recall matters more than precision -- pull a
+    # deeper pool than Buying's.
+    BROWSING_POOL_SIZE = 600
     # Candidates actually shown to the LLM in the prompt -- kept small to
     # fit Ollama's default 4096-token context alongside conversation history.
+    # Independent of the pool sizes above: the LLM only needs a
+    # representative sample to infer constraints/weights from, not the full
+    # pool (that's scored deterministically afterward).
     CANDIDATE_SAMPLE_SIZE = 18
     # How many dense-similarity hits to pull in on a Browsing turn, merged
     # with the keyword results before scoring.
@@ -306,6 +330,7 @@ class Agent:
             "tokenize='unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
+        popularity: list[tuple[float, str]] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
@@ -322,6 +347,10 @@ class Agent:
                     "average_rating": _as_float(product.get("average_rating")),
                 }
                 self._products[parent_asin] = fields
+                # rating_number (review count), not average_rating, as the
+                # popularity signal -- a handful of 5-star reviews shouldn't
+                # outrank a well-established, widely-bought item.
+                popularity.append((_as_float(product.get("rating_number")) or 0.0, parent_asin))
                 batch.append(tuple(fields[column] for column in CATALOG_COLUMNS))
                 if len(batch) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
@@ -335,6 +364,14 @@ class Agent:
         cursor.execute("CREATE VIRTUAL TABLE products_vocab USING fts5vocab('products', 'row')")
         self.connection.commit()
         self._catalog_size = len(self._products)
+
+        # Absolute last-resort recommendations (see _ensure_top_k): if a turn
+        # ever comes up short on real candidates, top up with the catalog's
+        # most-reviewed products rather than returning fewer than top_k. A
+        # blind popular-item guess scores the same as an empty slot (0) on a
+        # miss, but never worse, and occasionally hits by sheer popularity.
+        popularity.sort(key=lambda item: -item[0])
+        self._fallback_ids: list[str] = [parent_asin for _, parent_asin in popularity[:10]]
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = SessionState(profile=user_profile)
@@ -384,8 +421,9 @@ class Agent:
         """Pick up to `limit` search terms from the full turn history,
         favoring terms that are both recent and catalog-rare over ones that
         are merely recent-and-generic. A term confirmed via a direct
-        clarifying-question answer (state.disclosed) always survives the
-        cut, regardless of score -- it's a confirmed constraint, not
+        clarifying-question answer (state.disclosed) or captured as a
+        category anchor (state.category_terms, see _capture_category)
+        always survives the cut, regardless of score -- neither is
         incidental word choice."""
         total_turns = len(state.messages)
         if not total_turns:
@@ -398,17 +436,17 @@ class Agent:
             for term in _terms(message):
                 last_seen_turn[term] = turn_index
 
-        disclosed_terms: set[str] = set()
+        guaranteed_terms: set[str] = set(state.category_terms)
         for value in state.disclosed.values():
-            disclosed_terms.update(_terms(value))
+            guaranteed_terms.update(_terms(value))
 
         def score(term: str, turn_index: int) -> float:
             recency_weight = turn_index / total_turns  # (0, 1], most recent turn == 1.0
             return recency_weight * self._term_rarity(term)
 
         ranked = sorted(last_seen_turn, key=lambda term: -score(term, last_seen_turn[term]))
-        guaranteed = [term for term in ranked if term in disclosed_terms]
-        rest = [term for term in ranked if term not in disclosed_terms]
+        guaranteed = [term for term in ranked if term in guaranteed_terms]
+        rest = [term for term in ranked if term not in guaranteed_terms]
         return (guaranteed + rest)[:limit]
 
     def _retrieve_candidates(self, state: SessionState, limit: int) -> list[dict]:
@@ -682,7 +720,17 @@ class Agent:
 
     # ---- Stage 3: deterministic execution -------------------------------
 
-    def _score_candidates(self, candidates: list[dict], sheet: InstructionSheet) -> list[str]:
+    # Per-term category bonus and its cap. Deliberately small and capped:
+    # the category anchor is a lower-confidence, secondary signal (it's just
+    # whatever stood out in the opening message) and must never be able to
+    # outweigh an actual disclosed constraint, which is why this is a fixed
+    # ceiling rather than summed unbounded -- a candidate sharing several
+    # generic category words but matching none of the customer's real
+    # constraints should still lose to one that matches a real constraint.
+    CATEGORY_TERM_BONUS = 0.15
+    CATEGORY_BONUS_CAP = 0.5
+
+    def _score_candidates(self, state: SessionState, candidates: list[dict], sheet: InstructionSheet) -> list[str]:
         scored: list[tuple[float, int, str]] = []
         for rank, candidate in enumerate(candidates):
             combined_text = " ".join(
@@ -708,6 +756,11 @@ class Agent:
                     value_terms = set(_terms(value))
                     if value_terms and value_terms <= combined_terms:
                         score += weight
+
+            if state.category_terms:
+                category_hits = sum(1 for term in state.category_terms if term in combined_terms)
+                score += min(category_hits * self.CATEGORY_TERM_BONUS, self.CATEGORY_BONUS_CAP)
+
             # Tie-break toward the original retrieval order so an empty/
             # failed instruction sheet degrades to plain retrieval, not a
             # shuffle.
@@ -716,6 +769,38 @@ class Agent:
 
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [parent_asin for _, _, parent_asin in scored]
+
+    def _capture_category(self, state: SessionState, message: str) -> None:
+        """Anchor on the opening message's most salient terms once, on turn
+        1 -- reuses the same recency x rarity scoring as _ranked_query_terms
+        so "category" here means whatever's genuinely discriminative in the
+        opener, not just its first few words. See the category_terms field
+        comment on SessionState for why this is never refreshed later."""
+        if state.category_terms:
+            return
+        candidates = list(dict.fromkeys(_terms(message)))
+        if not candidates:
+            return
+        ranked = sorted(candidates, key=lambda term: -self._term_rarity(term))
+        state.category_terms = ranked[:6]
+
+    def _ensure_top_k(self, state: SessionState, ranked_ids: list[str], top_k: int) -> list[str]:
+        """Top up a short ranking rather than ever returning fewer than
+        top_k: first with the last turn's good ranking (still plausible --
+        the target rarely moves far turn to turn), then with the catalog's
+        most-reviewed products (a popular-item guess scores the same as an
+        empty slot on a miss, but never worse, and occasionally hits)."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for source in (ranked_ids, state.last_ranked, self._fallback_ids):
+            for parent_asin in source:
+                if parent_asin in seen or parent_asin not in self._products:
+                    continue
+                seen.add(parent_asin)
+                out.append(parent_asin)
+                if len(out) >= top_k:
+                    return out
+        return out
 
     def respond(
         self,
@@ -735,25 +820,43 @@ class Agent:
         # counting the turn (or the whole session) as a hard miss.
         try:
             state.record_message(user_message, turn)
+            self._capture_category(state, user_message)
 
             track = self._route_intent(state, user_message)
-            candidates = self._retrieve_candidates(state, self.CANDIDATE_POOL_SIZE)
+            pool_size = self.BROWSING_POOL_SIZE if track == "browsing" else self.CANDIDATE_POOL_SIZE
             if track == "browsing" and self._dense_ready:
+                # Reserve room for the dense merge below: retrieving a full
+                # pool_size of keyword hits first would satisfy
+                # _merge_candidates' limit before it ever looks at the dense
+                # list (it fills from the first group up to `limit` and
+                # stops there), silently dropping every dense candidate on
+                # any query popular enough to return pool_size keyword hits
+                # on its own -- which is most of them at this catalog size.
+                keyword_limit = max(1, pool_size - self.DENSE_CANDIDATE_SIZE)
+                candidates = self._retrieve_candidates(state, keyword_limit)
                 dense_hits = self._dense_candidates(state.query_text(), self.DENSE_CANDIDATE_SIZE)
-                candidates = self._merge_candidates(candidates, dense_hits, self.CANDIDATE_POOL_SIZE)
+                candidates = self._merge_candidates(candidates, dense_hits, pool_size)
+            else:
+                candidates = self._retrieve_candidates(state, pool_size)
 
             if not candidates:
+                ask_attribute = None
                 message = "Tell me a bit more about what you're looking for."
-                state.record_turn_result(None, message)
+                state.record_turn_result(ask_attribute, message)
+                # Never forfeit a scoreable turn to an empty candidate pool:
+                # fall back to the last good ranking, then popularity.
                 return {
                     "message": message,
-                    "ask_attribute": None,
-                    "recommendations": [],
+                    "ask_attribute": ask_attribute,
+                    "recommendations": [
+                        {"parent_asin": pid} for pid in self._ensure_top_k(state, [], top_k)
+                    ],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0},
                 }
 
             sheet = self._get_instruction_sheet(state, candidates, track)
-            ranked_ids = self._score_candidates(candidates, sheet)[:top_k]
+            ranked_ids = self._ensure_top_k(state, self._score_candidates(state, candidates, sheet)[:top_k], top_k)
+            state.last_ranked = ranked_ids
             message = sheet.message or "Here are the closest matches I found."
 
             # Hard enforcement, not just a prompt instruction: never re-ask
@@ -771,9 +874,17 @@ class Agent:
                 "usage": sheet.usage,
             }
         except Exception:
+            # Last line of defense: still try to serve the last good ranking
+            # or a popularity guess rather than an empty list, which forfeits
+            # the turn outright. self._fallback_ids is precomputed at index
+            # build time, so nothing here can raise a second time.
+            try:
+                ranked_ids = self._ensure_top_k(state, [], top_k)
+            except Exception:
+                ranked_ids = list(self._fallback_ids)
             return {
                 "message": "Sorry, could you tell me more about what you're looking for?",
                 "ask_attribute": None,
-                "recommendations": [],
+                "recommendations": [{"parent_asin": pid} for pid in ranked_ids],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0},
             }
