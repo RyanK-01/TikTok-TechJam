@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -23,6 +24,18 @@ STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
+    # Conversational filler: closed-class words above miss these, and
+    # because retail copy doesn't talk like a customer chats, plain
+    # catalog-rarity (see _term_rarity) actually scores them *higher* than
+    # real attribute words like "pants" or "shirt" -- rare in product text,
+    # but for the wrong reason. Left in, they'd out-rank genuine content
+    # words for the query-term budget.
+    "actually", "maybe", "really", "very", "just", "so", "well", "yeah",
+    "yes", "okay", "ok", "hi", "hello", "hey", "thanks", "thank", "am",
+    "was", "were", "do", "does", "did", "can", "could", "should", "shall",
+    "may", "might", "must", "kind", "sort", "basically", "literally",
+    "totally", "pretty", "quite", "rather", "still", "also", "even",
+    "much", "many", "more", "most", "think", "guess", "know", "mean",
 }
 
 # Simple, deliberately narrow signal for "the customer just replaced an
@@ -42,9 +55,25 @@ NO_PREFERENCE_RE = re.compile(r"don't have (?:an? )?(?:additional )?preference|n
 # non-empty disclosed-constraints dict) is treated as "the customer has
 # given us something concrete" -> Buying track. Their absence -> Browsing.
 BUDGET_RE = re.compile(r"\$\s?\d|\bunder\b|\bbudget\b|\bless than\b|\bcheap\b", re.IGNORECASE)
-MATERIAL_WORDS = {"cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric", "denim", "suede"}
-COLOR_WORDS = {"black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey", "purple", "yellow", "orange", "navy", "beige"}
-SIZE_WORDS = {"small", "medium", "large", "size", "xl", "xs", "wide", "narrow", "petite", "tall"}
+MATERIAL_WORDS = {
+    "cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon",
+    "fabric", "denim", "suede", "linen", "cashmere", "velvet", "satin", "canvas",
+    "mesh", "fleece", "corduroy", "tweed", "chiffon", "lace", "faux", "vegan",
+    "synthetic", "elastane", "lycra", "polyurethane", "microfiber", "sherpa",
+    "flannel", "jersey", "knit", "acrylic", "viscose", "modal", "bamboo", "hemp",
+}
+COLOR_WORDS = {
+    "black", "white", "blue", "red", "pink", "green", "brown", "gray", "grey",
+    "purple", "yellow", "orange", "navy", "beige", "tan", "khaki", "maroon",
+    "teal", "turquoise", "gold", "silver", "ivory", "cream", "burgundy", "olive",
+    "mustard", "lavender", "coral", "charcoal", "multicolor", "multicolour",
+    "rose", "magenta", "cyan", "indigo", "plum", "mint", "peach", "camel", "rust",
+}
+SIZE_WORDS = {
+    "small", "medium", "large", "size", "xl", "xs", "xxl", "xxs", "xxxl", "wide",
+    "narrow", "petite", "tall", "short", "long", "slim", "loose", "relaxed",
+    "oversized", "regular", "plus", "big", "junior", "toddler", "youth",
+}
 
 CATALOG_COLUMNS = ("parent_asin", "title", "categories", "features", "details", "store", "description")
 
@@ -235,6 +264,10 @@ class Agent:
     # How many dense-similarity hits to pull in on a Browsing turn, merged
     # with the keyword results before scoring.
     DENSE_CANDIDATE_SIZE = 60
+    # Max terms fed into the FTS MATCH query (see _ranked_query_terms). This
+    # only sizes a SQLite OR-query, not the Ollama prompt -- CANDIDATE_SAMPLE_SIZE
+    # and conversation length are what matter for the LLM's context budget.
+    QUERY_TERM_LIMIT = 70
     LLM_FAILURE_THRESHOLD = 3
 
     EMBED_BATCH_SIZE = 250
@@ -247,6 +280,8 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, dict] = {}
+        self._catalog_size = 0
+        self._term_rarity_cache: dict[str, float] = {}
         self._build_index()
 
         self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -293,7 +328,13 @@ class Agent:
                     batch.clear()
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+        # 'row' vocab: one row per term with the number of documents (products)
+        # it appears in. Backed by the same FTS index, so this is an
+        # index-lookup per term, not a new corpus scan -- used to weight
+        # query terms by how discriminative they are (see _term_rarity).
+        cursor.execute("CREATE VIRTUAL TABLE products_vocab USING fts5vocab('products', 'row')")
         self.connection.commit()
+        self._catalog_size = len(self._products)
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = SessionState(profile=user_profile)
@@ -317,8 +358,61 @@ class Agent:
 
     # ---- Stage 1a: cheap keyword retrieval -----------------------------
 
+    def _term_rarity(self, term: str) -> float:
+        """How discriminative `term` is across the catalog -- a classic idf.
+        A common word ("shirt") barely narrows the candidate pool; a rare
+        one ("corduroy") does most of the work, so it should outweigh a
+        recently-said but generic word when both are competing for the
+        query-term budget. Backed by SQLite's own fts5vocab table (an
+        index lookup, not a corpus scan), and cached since the catalog is
+        static for the life of the process."""
+        cached = self._term_rarity_cache.get(term)
+        if cached is not None:
+            return cached
+        row = self.connection.execute(
+            "SELECT doc FROM products_vocab WHERE term = ?", (term,)
+        ).fetchone()
+        doc_freq = row[0] if row else 0
+        # +1 smoothing on both sides: keeps the score finite and positive
+        # even for a term absent from the catalog entirely (a typo, a brand
+        # name outside the index) instead of dividing by zero or blowing up.
+        rarity = math.log((self._catalog_size + 1) / (doc_freq + 1)) + 1.0
+        self._term_rarity_cache[term] = rarity
+        return rarity
+
+    def _ranked_query_terms(self, state: SessionState, limit: int) -> list[str]:
+        """Pick up to `limit` search terms from the full turn history,
+        favoring terms that are both recent and catalog-rare over ones that
+        are merely recent-and-generic. A term confirmed via a direct
+        clarifying-question answer (state.disclosed) always survives the
+        cut, regardless of score -- it's a confirmed constraint, not
+        incidental word choice."""
+        total_turns = len(state.messages)
+        if not total_turns:
+            return []
+
+        # Most recent turn each term appeared in (1-indexed) -- a term
+        # mentioned again later "refreshes" its recency.
+        last_seen_turn: dict[str, int] = {}
+        for turn_index, message in enumerate(state.messages, start=1):
+            for term in _terms(message):
+                last_seen_turn[term] = turn_index
+
+        disclosed_terms: set[str] = set()
+        for value in state.disclosed.values():
+            disclosed_terms.update(_terms(value))
+
+        def score(term: str, turn_index: int) -> float:
+            recency_weight = turn_index / total_turns  # (0, 1], most recent turn == 1.0
+            return recency_weight * self._term_rarity(term)
+
+        ranked = sorted(last_seen_turn, key=lambda term: -score(term, last_seen_turn[term]))
+        guaranteed = [term for term in ranked if term in disclosed_terms]
+        rest = [term for term in ranked if term not in disclosed_terms]
+        return (guaranteed + rest)[:limit]
+
     def _retrieve_candidates(self, state: SessionState, limit: int) -> list[dict]:
-        unique_terms = list(dict.fromkeys(_terms(state.query_text())))[:40]
+        unique_terms = self._ranked_query_terms(state, self.QUERY_TERM_LIMIT)
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
             return []
@@ -394,6 +488,24 @@ class Agent:
                 ids = json.loads(self.EMBEDDING_IDS_PATH.read_text(encoding="utf-8"))
                 matrix = np.load(self.EMBEDDINGS_PATH)
                 if len(ids) == matrix.shape[0] == len(self._products):
+                    # Row count matching the catalog doesn't guarantee the
+                    # cache was built with the embedding model we'll use for
+                    # live queries -- a stale cache from a different model
+                    # (different vector width) would otherwise pass this
+                    # check, then hard-crash every dense lookup later deep
+                    # inside a matmul (see _dense_candidates). One cheap
+                    # live probe call catches that up front, at cost of a
+                    # single extra embed call per process start.
+                    live_dim = self._probe_embedding_dim()
+                    if live_dim is not None and live_dim != matrix.shape[1]:
+                        print(
+                            f"[agent] cached embeddings are {matrix.shape[1]}-dim but the live "
+                            f"'{self.embed_model}' model produces {live_dim}-dim vectors -- "
+                            "dense retrieval disabled until the cache is rebuilt (delete "
+                            f"{self.EMBEDDINGS_PATH} and {self.EMBEDDING_IDS_PATH}, or set "
+                            "OLLAMA_EMBED_MODEL to match the model that built the cache)."
+                        )
+                        return
                     self._embedding_matrix = matrix
                     self._embedding_ids = ids
                     self._dense_ready = True
@@ -402,6 +514,19 @@ class Agent:
             self._build_embeddings()
         except Exception as exc:
             print(f"[agent] dense retrieval unavailable ({exc}) -- Browsing falls back to keyword search.")
+
+    def _probe_embedding_dim(self) -> int | None:
+        """One throwaway live embed call, used only to size-check the cache
+        against whatever model is actually configured right now. Returns
+        None (rather than raising) if Ollama isn't reachable at startup --
+        that's a separate, already-handled failure mode, not evidence of a
+        cache mismatch, so it shouldn't block trusting an otherwise-valid
+        cache."""
+        try:
+            vectors = self._embed_batch(["dimension probe"], attempts=1)
+            return len(vectors[0])
+        except Exception:
+            return None
 
     def _dense_candidates(self, query_text: str, limit: int) -> list[dict]:
         if not self._dense_ready or self._dense_disabled or not query_text.strip():
@@ -418,6 +543,21 @@ class Agent:
             self._dense_failures += 1
             if self._dense_failures >= self.LLM_FAILURE_THRESHOLD:
                 self._dense_disabled = True
+            return []
+
+        # Belt-and-suspenders: _ensure_embeddings probes for this at startup,
+        # but a live query vector of the wrong width must never reach the
+        # matmul below -- that raises ValueError uncaught by any try/except
+        # in this method, which used to propagate all the way up through
+        # respond()'s outer catch-all and silently blank out the entire
+        # turn (empty recommendations, no LLM call) instead of just
+        # skipping the dense contribution for this one query.
+        if vector.shape[0] != self._embedding_matrix.shape[1]:
+            self._dense_disabled = True
+            print(
+                f"[agent] live query embedding is {vector.shape[0]}-dim but the cached matrix "
+                f"is {self._embedding_matrix.shape[1]}-dim -- disabling dense retrieval."
+            )
             return []
 
         scores = self._embedding_matrix @ vector
@@ -548,6 +688,13 @@ class Agent:
             combined_text = " ".join(
                 candidate.get(field_name, "") for field_name in CATALOG_COLUMNS[1:]
             ).lower()
+            # Token set, not raw text -- lets constraint matching below survive
+            # word order/spacing differences from a plain substring check
+            # (e.g. constraint "leather boots" now matches "boots made of
+            # leather"). Plurals/stems still won't collide (a real stemmer
+            # would be the next step); MATERIAL_WORDS/COLOR_WORDS/SIZE_WORDS
+            # cover the common variant spellings instead.
+            combined_terms = set(_terms(combined_text))
 
             score = 0.0
             for attribute, value in sheet.constraints.items():
@@ -557,8 +704,10 @@ class Agent:
                     price = candidate.get("price")
                     if budget_max is not None and price is not None and price <= budget_max:
                         score += weight
-                elif value.lower() in combined_text:
-                    score += weight
+                else:
+                    value_terms = set(_terms(value))
+                    if value_terms and value_terms <= combined_terms:
+                        score += weight
             # Tie-break toward the original retrieval order so an empty/
             # failed instruction sheet degrades to plain retrieval, not a
             # shuffle.

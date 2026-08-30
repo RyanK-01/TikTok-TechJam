@@ -11,6 +11,7 @@ venv/
 # Downloaded/generated data (see README: download from GitHub Release)
 catalog.jsonl.gz
 data/catalog.jsonl
+data/slice50.jsonl
 data/releases/
 
 # Cached dense-retrieval embedding index (regenerated automatically by
