@@ -7,6 +7,11 @@ results_*.json
 data/dev_slice.jsonl
 data/catalog.jsonl
 data/releases/
+# Orphaned dense-retrieval artifacts from an abandoned experiment (a
+# different branch's embedding-based retrieval attempt). Unused by the
+# current agent -- it does not import numpy or read these files.
+data/embeddings.npy
+data/embeddings_ids.json
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
 secure/
