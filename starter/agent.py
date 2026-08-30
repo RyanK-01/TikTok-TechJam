@@ -4,12 +4,13 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # NOTE: a dense/embedding retrieval path used to live here. It was cut
-# (Task 5): _merge_candidates filled from the keyword pool first and
+# (CLAUDE_CODE_PLAN §5.5): _merge_candidates filled from the keyword pool first and
 # returned once it hit CANDIDATE_POOL_SIZE, which the keyword retriever
 # always satisfied, so dense hits were never merged -- a measured 0.000
 # contribution for a 25-minute embedding build and a per-turn network
@@ -17,13 +18,68 @@ from pathlib import Path
 # (see _route_intent / _retrieve_candidates). numpy is no longer imported.
 
 
-# The LLM is confined to reranking the retrieved candidate pool and is OFF
-# by default. Question selection is fully deterministic (Section 5.1/5.2): a
-# well-reasoned semantic attribute scores worse than "other" against this
-# simulator, so the LLM must never touch the ask. Flip LLM_RERANK=1 only on
-# a box with Ollama reachable, and only ship it on if it measurably beats
-# the deterministic score on the public set.
-LLM_RERANK = os.environ.get("LLM_RERANK", "0") == "1"
+# LLM reranking has been RETIRED (DEV_TASKS Step 1). It was a measured
+# regression: LLM_RERANK=1 with qwen2.5:7b-instruct scored 0.8643 vs 0.8686
+# deterministic on the first 50 public sessions -- worse by 0.0043 for
+# ~128k tokens -- because _score_candidates summed one unbounded LLM weight
+# per constraint key (5 keys x 0.5 = 2.5, against PHRASE_BONUS 3.0), so the
+# LLM layer could outweigh a verbatim phrase hit in aggregate and bury a
+# rank-1 deterministic hit (public_0018). Question selection stays fully
+# deterministic (CLAUDE_CODE_PLAN §5.1/§5.2): a well-reasoned semantic
+# attribute scores worse than "other" against this simulator.
+#
+# What replaces it (DEV_TASKS Steps 2-7): a repair ladder in Agent._ingest
+# that recovers constraint phrases the regex templates miss (a paraphrased
+# private simulator, per docs/competition_specification.md:40). Rungs:
+#   1. regex templates + known dead-end/drain/boundary shapes  (SessionState)
+#   2. induced templates learned from earlier paraphrase sightings  (Step 5,
+#      default off) -- claims the reply
+#   3. generic "<intent word> ... : <trailing clause>" colon cue  (Step 2) --
+#      claims the reply
+#   4. deterministic catalog span probe -- longest discriminative reply span
+#      occurring verbatim in the FTS5 structured fields  (Step 2) -- ADDITIVE
+#   5. guarded LLM reply-interpreter -- one sentence, JSON, <=160 tokens
+#      (Step 4, default off) -- only if the span probe found nothing
+#   6. token-residue backstop -- always, unchanged 1.2x token-overlap weight
+# Plus a turn-1 LLM coarse-category recovery for paraphrased openers
+# (Step 6, default off).
+#
+# On the current public simulator rung 1 catches every reply, so rungs 2-6
+# never execute and every flag below is byte-identical to the deterministic
+# agent with zero network calls. The LLM output never produces a weight, a
+# score, or an ordering -- only a constraint phrase, scored by the same
+# deterministic path (doc-set membership) with its whole-layer contribution
+# clamped: SPAN_EVIDENCE_CAP + LLM_EVIDENCE_CAP < PHRASE_BONUS, so one
+# verbatim regex phrase hit always outweighs the entire span+LLM layer and
+# the public_0018 demotion is structurally impossible.
+# _ollama_generate / _llm_failures / _llm_disabled back the ladder.
+#
+# ---- Offline-fallback statement (DEV_TASKS Step 7) ---------------------
+# docs/submission_rules.md:59 -- "organizer policy may disable network access"
+# for final scoring. The default configuration makes ZERO network calls and
+# ZERO LLM tokens: network disabled => agent unchanged => 0.830 public score.
+# No LLM feature is load-bearing.
+#
+# ---- LLM cost / latency disclosure -----------------------------------
+#   config                               | calls/800 | tokens | added wall
+#   default (flags off)                  |     0     |   0    |   0
+#   LLM_EXTRACT=1, unparaphrased          |     0     |   0    |   0    (MEASURED: public set, total_tokens==0)
+#   LLM_EXTRACT=1, paraphrased, no cache  | <=150 (MAX_LLM_CALLS_TOTAL) | ~24k | ~20 min   [NOT MEASURED -- no Ollama on build host]
+#   LLM_EXTRACT=1 + LLM_TEMPLATE_CACHE=1  | ~N distinct templates (<50) | <8k  | <7 min    [NOT MEASURED -- no Ollama on build host]
+# Per call: <=160 tokens (num_predict 64, num_ctx 1024), temperature 0,
+# OLLAMA_EXTRACT_TIMEOUT default 8s. After LLM_FAILURE_THRESHOLD (3)
+# cumulative failures (never reset) the LLM latches off for the run.
+
+# All LLM flags default OFF.
+LLM_EXTRACT = os.environ.get("LLM_EXTRACT", "0") == "1"
+# DEV_TASKS Step 5, decision D2: cross-session template-induction cache.
+# Shipped OFF. Learns message-language patterns only (never product / target
+# / ground-truth data). Also gated on LLM_EXTRACT (it is fed by extractions).
+LLM_TEMPLATE_CACHE = os.environ.get("LLM_TEMPLATE_CACHE", "0") == "1"
+# DEV_TASKS Step 2: the deterministic catalog span probe. ON by default --
+# zero tokens, and it never fires on the current simulator. SPAN_PROBE=0
+# disables it to capture the pre-Step-2 reference on the paraphrase harness.
+SPAN_PROBE = os.environ.get("SPAN_PROBE", "1") == "1"
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 STOPWORDS = {
@@ -48,6 +104,25 @@ RE_KEYREQ = re.compile(r"key requirement is:\s*(.+?)\.?$", re.IGNORECASE)
 RE_MATTERS = re.compile(r"what matters is:\s*(.+?)\.?$", re.IGNORECASE)
 RE_OVERRIDE = re.compile(r"ignore my earlier preference.*?What I need is:\s*(.+?)\.?$", re.IGNORECASE)
 
+# Generic "intent word + colon + trailing clause" fallback (DEV_TASKS Step 2
+# repair ladder). The four templates above are exact wordings of the current
+# simulator; a paraphrased private simulator that still punctuates with a
+# colon ("Here's what counts for me: 100% Leather; Buckle closure.") is caught
+# here without a model. Requires a whole-word intent cue AND a colon AND a
+# short lead-in. Every captured clause is still catalog-grounded through
+# _span_docset before it is admitted (as span provenance); if none of the
+# clauses ground, the cue does NOT claim the reply and the ladder continues.
+# Never matches a public-set reply (those are claimed earlier by RE_MATTERS /
+# RE_KEYREQ / RE_OVERRIDE, or are dead-end replies), so the public score is
+# untouched.
+RE_GENERIC_CUE = re.compile(
+    r"\b(?:matters?|need(?:ed)?|want(?:ed)?|require[ds]?|essential|"
+    r"must[- ]?have|looking for|care about|counts?|prioriti\w*|"
+    r"key thing|important|details?)\b"
+    r"[^:]{0,40}:\s*(\S.+?)\.?\s*$",
+    re.IGNORECASE,
+)
+
 
 def _is_dead_end_reply(lowered: str) -> bool:
     """True for the simulator's zero-information replies -- these must never
@@ -58,6 +133,16 @@ def _is_dead_end_reply(lowered: str) -> bool:
         or "don't have an additional preference" in lowered
         or "don't have a preference for" in lowered
     )
+
+# Canonical zero-information replies, used to reject an induced regex
+# (DEV_TASKS Step 5) that would otherwise start matching a dead-end shape
+# and poison the constraint list.
+_DEAD_END_SAMPLES = (
+    "Those options are not quite right yet. Ask me about one specific attribute.",
+    "I don't have an additional preference for other.",
+    "I don't have an additional preference for material.",
+    "I don't have a preference for color; please use your judgment.",
+)
 
 # Simple, deliberately narrow signal for "the customer just replaced an
 # earlier preference" (Intent Override sessions). It only clears
@@ -94,35 +179,12 @@ SIZE_WORDS = {"small", "medium", "large", "size", "xl", "xs", "wide", "narrow", 
 
 CATALOG_COLUMNS = ("parent_asin", "title", "categories", "features", "details", "store", "description")
 
+# The simulator's attribute vocabulary (evaluator ALLOWED_ATTRIBUTES). Kept
+# as the canonical domain for question selection.
 ALLOWED_ATTRIBUTES = frozenset({
     "category", "material", "color", "size", "style", "brand",
     "budget", "feature", "use_case", "other",
 })
-
-SYSTEM_PROMPT = (
-    "You are the ranking assistant inside a shopping agent for an Amazon "
-    "Clothing/Shoes/Jewelry catalog. Each turn you receive the conversation "
-    "so far, what the customer has already told us, a detected Buying/"
-    "Browsing track, and a sample of currently-matching products. Output "
-    "ONE JSON object describing how to filter and rank the full candidate "
-    "pool -- you do not pick products directly, you never see full product "
-    "IDs, and you do NOT decide what to ask the customer.\n\n"
-    "Rules:\n"
-    "- Use only the allowed attribute names below.\n"
-    "- On a BUYING turn, favor fewer, higher-confidence constraints (the "
-    "customer has told us something concrete -- lock onto it).\n"
-    "- On a BROWSING turn, the candidate pool is more varied by design; "
-    "spread weight across plausible interpretations.\n"
-    "- Respond with JSON only, matching the schema exactly. No prose, no "
-    "markdown fences.\n\n"
-    "Allowed attribute names: " + ", ".join(sorted(ALLOWED_ATTRIBUTES)) + ".\n\n"
-    "Schema:\n"
-    "{\n"
-    '  "constraints": {"<attribute>": "<value>", ...},\n'
-    '  "weights": {"<attribute>": <0.0-1.0>, ...},\n'
-    '  "message": "<one short, natural sentence to the customer>"\n'
-    "}"
-)
 
 
 def _text(value: object) -> str:
@@ -185,6 +247,18 @@ class SessionState:
     # replies. Each is a literal substring of the target document, so
     # substring containment scoring is close to a direct lookup.
     constraints: list[str] = field(default_factory=list)
+    # Provenance of the non-template rungs of Agent._ingest's repair ladder.
+    # A phrase in one of these sets is scored by doc-set membership, per
+    # provenance, with the whole layer's contribution clamped below
+    # PHRASE_BONUS (SPAN_EVIDENCE_CAP / LLM_EVIDENCE_CAP -- see
+    # _score_candidates). Both empty on the current simulator.
+    span_constraints: set[str] = field(default_factory=set)
+    llm_constraints: set[str] = field(default_factory=set)
+    # How the last customer reply was parsed: "template" | "override" |
+    # "drain" | "boundary" | "induced" | "span" | "llm" | "residue", or
+    # "unparsed" until a rung claims it. Agent._ingest only runs the repair
+    # ladder while this is "unparsed" -- SessionState stays index/IO-free.
+    parse_source: str = "unparsed"
     # Set once the simulator reports the intent card is fully drained
     # ("I don't have an additional preference for other."). After this,
     # asking yields nothing, so _select_ask_attribute returns None.
@@ -193,7 +267,7 @@ class SessionState:
     # Distinct from declined (boundary) but treated the same by the asker.
     exhausted: set[str] = field(default_factory=set)
     # Rough count of disclosed constraint phrases, for the question-value
-    # estimator. Replaced by len(constraints) once exact-phrase scoring lands.
+    # estimator; kept in step with len(constraints) as the ladder admits.
     disclosed_count: int = 0
     # Paraphrase-proof backstop: if the drain string is reworded on the
     # private set we would never see card_drained; stop asking after this
@@ -206,7 +280,8 @@ class SessionState:
     # Last successfully-scored ranking. Re-served verbatim if a later turn
     # fails internally, so a transient bug never costs a scoreable turn.
     last_ranked: list[str] = field(default_factory=list)
-    # Ollama calls made this session (only non-zero when LLM_RERANK=1).
+    # Ollama calls made this session by the guarded reply-interpreter
+    # (DEV_TASKS Step 4). Always 0 with LLM_EXTRACT off.
     llm_calls: int = 0
 
     def _add_constraint(self, phrase: str) -> bool:
@@ -218,6 +293,7 @@ class SessionState:
 
     def record_message(self, message: str, turn: int) -> None:
         self.turn = turn
+        self.parse_source = "unparsed"
         lowered = message.lower()
         gained = False
 
@@ -242,7 +318,11 @@ class SessionState:
                 value = match.group(1).strip(" .;,-")
                 if value:
                     self.override_value = value
+                    self.parse_source = "override"
                     gained = self._add_constraint(value)
+            # If RE_OVERRIDE missed (paraphrased "what I need is:"), leave
+            # parse_source "unparsed" so Agent._ingest's ladder recovers the
+            # new value -- as an ordinary span, not with OVERRIDE_PHRASE_BONUS.
         else:
             drain = DRAINED_RE.search(message)
             boundary = NO_PREFERENCE_RE.search(message)
@@ -252,9 +332,11 @@ class SessionState:
                     self.exhausted.add(attribute)
                 else:
                     self.card_drained = True
+                self.parse_source = "drain"
             elif boundary:
                 if self.last_asked:
                     self.declined.add(self.last_asked)
+                self.parse_source = "boundary"
             else:
                 for regex in (RE_KEYREQ, RE_MATTERS):
                     hit = regex.search(message)
@@ -262,17 +344,14 @@ class SessionState:
                         # RE_MATTERS can carry two constraints joined by ";".
                         for part in hit.group(1).split(";"):
                             gained |= self._add_constraint(part)
-                if not gained and self.last_asked and not _is_dead_end_reply(lowered):
-                    # Paraphrase fallback (Section 5.3): the private simulator
-                    # may reword its reply templates. If no template matched
-                    # but the customer answered our question, keep the token
-                    # residue as a low-confidence constraint so the agent
-                    # still accumulates signal. Regex parsing degrades, it
-                    # does not collapse.
-                    residue = " ".join(_terms(message)[:12])
-                    gained |= self._add_constraint(residue)
-                if gained and self.last_asked:
-                    self.disclosed[self.last_asked] = message
+                if gained:
+                    self.parse_source = "template"
+                    if self.last_asked:
+                        self.disclosed[self.last_asked] = message
+                # No template match -> parse_source stays "unparsed"; the
+                # span probe / LLM rungs in Agent._ingest take over. The old
+                # token-residue admission that lived here is now the ladder's
+                # last rung (index-dependent parsing belongs on Agent).
 
         if "what matters is" in lowered:
             self.disclosed_count += lowered.split("what matters is", 1)[1].count(";") + 1
@@ -306,68 +385,24 @@ class SessionState:
 
 
 @dataclass
-class InstructionSheet:
-    """The LLM's answer for one turn: how to filter/rank candidates, and
-    whether to ask a clarifying question instead."""
+class _InducedTemplate:
+    """A regex induced from wrapper prose around an earlier recovered value
+    (DEV_TASKS Step 5). ``hits`` counts reuse; the cache evicts LFU."""
 
-    constraints: dict[str, str] = field(default_factory=dict)
-    weights: dict[str, float] = field(default_factory=dict)
-    ask_attribute: str | None = None
-    message: str = ""
-    usage: dict = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0})
-
-    @classmethod
-    def parse(cls, raw: str) -> "InstructionSheet":
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("instruction sheet must be a JSON object")
-
-        constraints = {
-            str(key): str(value)
-            for key, value in (data.get("constraints") or {}).items()
-            if value not in (None, "", [])
-        }
-
-        weights: dict[str, float] = {}
-        for key, value in (data.get("weights") or {}).items():
-            try:
-                weights[str(key)] = max(0.0, min(1.0, float(value)))
-            except (TypeError, ValueError):
-                continue
-
-        # Parsed tolerantly (a model may still emit the key) but NOT used by
-        # respond() -- question selection is deterministic, see Section 5.2.
-        ask_attribute = data.get("ask_attribute")
-        if ask_attribute is not None:
-            ask_attribute = str(ask_attribute).strip().lower()
-            if ask_attribute in ("", "null", "none"):
-                ask_attribute = None
-            elif ask_attribute not in ALLOWED_ATTRIBUTES:
-                ask_attribute = "other"
-
-        message = data.get("message")
-        message = str(message).strip() if message else ""
-
-        return cls(constraints=constraints, weights=weights, ask_attribute=ask_attribute, message=message)
-
-    @classmethod
-    def fallback(cls) -> "InstructionSheet":
-        # Empty constraints -> the executor's scoring collapses to the
-        # original retrieval order, and respond() fills in a generic message.
-        return cls()
+    regex: "re.Pattern[str]"
+    pattern: str
+    hits: int = 1
 
 
 class Agent:
-    """Two-track keyword retrieval -> LLM instruction sheet -> deterministic
-    execution.
+    """Two-track keyword retrieval -> deterministic exact-phrase execution.
 
     Pipeline per turn: update SessionState -> route the turn to a Buying
     (narrow, phrase-locked) or Browsing (wide, category-driven) retrieval
-    track -> optionally ask a local LLM (via Ollama, off by default) for a
-    small JSON "instruction sheet" (constraints + weights) -> apply that
-    sheet on top of exact-phrase scoring deterministically -> return top_k.
-    Any LLM failure falls back to the plain retrieval order rather than
-    raising.
+    track -> re-score the retrieved pool by verbatim constraint-phrase
+    containment -> return top_k. Fully deterministic and network-free. The
+    LLM rerank that used to sit between retrieval and scoring was retired as
+    a measured regression (see the module docstring at the top of this file).
     """
 
     MAX_TURNS = 10
@@ -384,14 +419,51 @@ class Agent:
     # once >=3 constraints were known; it regressed buying Hit@10 by ~0.05
     # on the public set -- see README -- and was removed.)
     BROWSING_POOL_SIZE = 600
-    # Candidates actually shown to the LLM in the prompt -- kept small to
-    # fit Ollama's default 4096-token context alongside conversation history.
-    CANDIDATE_SAMPLE_SIZE = 18
-    LLM_FAILURE_THRESHOLD = 3
-    # Hard ceiling on Ollama calls per session when LLM_RERANK=1 (Task 7).
-    MAX_LLM_CALLS_PER_SESSION = 3
 
-    # --- Question-value estimation (Section 5.1) --------------------------
+    # --- Guarded LLM reply-interpreter (DEV_TASKS Steps 4-7) -------------
+    # After this many CUMULATIVE Ollama failures in a run (the counter is
+    # never reset -- DEV_TASKS Step 4) the LLM path latches off for the rest
+    # of the run.
+    LLM_FAILURE_THRESHOLD = 3
+    # Ollama calls per session (shared by the reply-interpreter and the
+    # turn-1 category recovery of Step 6).
+    MAX_LLM_CALLS_PER_SESSION = 3
+    # Absolute ceiling on Ollama calls for the whole evaluation run
+    # (DEV_TASKS Step 7). At ~160 tokens/call this bounds a fully paraphrased
+    # 800-session private run to ~24k tokens / ~20 min of added wall clock.
+    MAX_LLM_CALLS_TOTAL = 150
+
+    # --- Deterministic catalog span probe (DEV_TASKS Step 2) ------------
+    # Recover a constraint value from a reply whose wrapper prose the regex
+    # templates miss, by finding the longest contiguous token span of the
+    # reply that occurs verbatim in the FTS5 index and is discriminative.
+    # Works because local_evaluator.intent_card() pulls every constraint
+    # value verbatim from the target's own features/details, so the value is
+    # a literal substring of some catalog document even under paraphrasing
+    # (rewording the wrapper cannot alter a metadata string). Zero tokens.
+    #
+    # SPAN_DF_CAP: a phrase matching more than ~0.4% of a 50k catalog
+    # (~200 docs) carries < ~8 bits and is a category word, not a constraint
+    # value. Derived from catalog size, NOT tuned on public sessions.
+    SPAN_DF_CAP = 200
+    # SPAN_BONUS / LLM_BONUS: per-hit weight for a doc-set-verified span or
+    # LLM phrase -- between the token-overlap tier (<=1.2) and a verbatim
+    # regex-template hit (PHRASE_BONUS 3.0). The SUMMED span+LLM contribution
+    # on any single candidate is clamped (SPAN_EVIDENCE_CAP + LLM_EVIDENCE_CAP
+    # = 2.9 < PHRASE_BONUS), so one verbatim template phrase hit always
+    # dominates the entire span+LLM layer -- see _score_candidates.
+    SPAN_BONUS = 2.0
+    LLM_BONUS = 2.0
+    SPAN_EVIDENCE_CAP = 2.0
+    LLM_EVIDENCE_CAP = 0.9
+    # Bound the span enumeration: at most this many FTS5 phrase queries per
+    # unparsed reply; stop on the first accepted span.
+    MAX_SPAN_PROBES = 40
+    # Cap on regexes induced from earlier paraphrase sightings, evicted
+    # least-frequently-used (DEV_TASKS Step 5, default OFF).
+    MAX_INDUCED_TEMPLATES = 8
+
+    # --- Question-value estimation (CLAUDE_CODE_PLAN §5.1) ----------------
     # The intent card is 2 hard + 2 soft constraints.
     EXPECTED_CARD_SIZE = 4
     # Stop asking after this many consecutive info-free replies even if we
@@ -427,8 +499,21 @@ class Agent:
         self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         self.model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
         self.llm_timeout = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
+        # Failure here is benign (we fall through to the token-residue rung);
+        # a 30s stall is not. Separate, shorter budget for the interpreter.
+        self.extract_timeout = float(os.environ.get("OLLAMA_EXTRACT_TIMEOUT", "8"))
         self._llm_failures = 0
         self._llm_disabled = False
+        # DEV_TASKS Step 7: run-wide LLM accounting (persists across sessions;
+        # local_evaluator constructs Agent once and reset()s per session).
+        self._llm_total_calls = 0
+        self._llm_wall_seconds = 0.0
+        # DEV_TASKS Step 2: memoised span -> matching parent_asin set, keyed
+        # by span string. Bounds FTS5 phrase queries across the whole run.
+        self._span_df_cache: dict[str, frozenset[str]] = {}
+        # DEV_TASKS Step 5: regexes induced from earlier paraphrase sightings.
+        # Persists across sessions; LFU eviction at MAX_INDUCED_TEMPLATES.
+        self._induced_templates: list[_InducedTemplate] = []
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -469,7 +554,7 @@ class Agent:
 
         # Precomputed once: the 10 most-reviewed products, used as an
         # absolute last-resort recommendation list so respond() can never
-        # return fewer than 10 candidates (Task 6). A blind guess scores 0,
+        # return fewer than 10 candidates (CLAUDE_CODE_PLAN §5.6). A blind guess scores 0,
         # but so does an empty list -- and the empty list forfeits the turn.
         popularity.sort(key=lambda item: -item[0])
         self._fallback_ids: list[str] = [asin for _, asin in popularity[:10]]
@@ -493,6 +578,323 @@ class Agent:
         if state.disclosed or state.constraints:
             return "buying"
         return "browsing"
+
+    # ---- Reply ingestion: the repair ladder --------------------------
+
+    def _ingest(self, state: SessionState, message: str, turn: int) -> dict:
+        """Update SessionState from one customer reply, then -- only if the
+        regex templates did not claim it -- walk the repair ladder to recover
+        constraint phrases a paraphrased simulator would hide
+        (docs/competition_specification.md:40). Returns a token-usage dict
+        (all-zero unless the Step 4 LLM rung fired).
+
+        Ladder (see the module docstring for the full list), on an unparsed
+        reply that should carry an answer:
+          - induced templates (Step 5, default off) -- claims the reply
+          - generic colon cue (Step 2) -- claims the reply
+          - catalog span probe (Step 2) -- ADDITIVE doc-set-verified phrases;
+            does NOT suppress the residue backstop, because a paraphrase often
+            buries the value among wrapper tokens the residue still covers
+            (measured: span-XOR-residue regressed L1 vs residue-only)
+          - guarded LLM reply-interpreter (Step 4, default off) -- only if the
+            span probe found nothing this turn
+          - token-residue backstop -- always, unchanged 1.2x token-overlap weight
+        Plus turn-1 LLM coarse-category recovery (Step 6, default off).
+
+        Never raises into respond()'s blanket handler -- every rung that
+        touches the FTS5 index or the network has its own inner guard.
+        """
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        state.record_message(message, turn)
+
+        # DEV_TASKS Step 6: turn-1 coarse-category recovery. If RE_INITIAL
+        # missed a paraphrased opener, state.category is empty and the tripled
+        # category terms in retrieval + the +0.6 category bonus in scoring
+        # silently die. One LLM call, turn 1 only. RE_INITIAL matches every
+        # public-set opener, so this never fires there.
+        if (
+            turn == 1
+            and not state.category
+            and LLM_EXTRACT
+            and self._llm_budget_ok(state)
+        ):
+            self._recover_category(state, message, usage)
+
+        if state.parse_source != "unparsed":
+            return usage
+        # The ladder only runs when the reply should carry an answer (we
+        # asked a question last turn) and is not a known zero-information
+        # reply. On the current simulator this is never both true, so the
+        # ladder never executes on the public set -- LLM-on == LLM-off.
+        if state.last_asked is None:
+            return usage
+        if _is_dead_end_reply(message.lower()):
+            return usage
+
+        if self._apply_induced_templates(state, message):
+            return usage
+
+        # Generic colon-cue fallback. Gated with the span probe so SPAN_PROBE=0
+        # is a faithful "repair ladder off" reference (token residue only, as
+        # before Step 2). Only claims the reply if at least one captured clause
+        # is catalog-grounded; grounded clauses are admitted as SPAN provenance
+        # (doc-set-verified, clamped), NOT as full-weight template phrases.
+        cue = RE_GENERIC_CUE.search(message) if SPAN_PROBE else None
+        if cue:
+            grounded: list[str] = []
+            for raw in cue.group(1).split(";"):
+                part = raw.strip(" .;,-")
+                if 4 <= len(part) <= 120 and self._phrase_in_catalog(part):
+                    grounded.append(part)
+            if grounded:
+                for part in grounded:
+                    if state._add_constraint(part):
+                        state.span_constraints.add(part)
+                self._note_admitted(state, message, "span")
+                if len(grounded) == 1:
+                    self._induce_template(message, grounded[0])
+                return usage
+
+        before = len(state.constraints)
+        source = "residue"
+        spans_this_turn: list[str] = []
+        if SPAN_PROBE:
+            for span in self._verbatim_spans(message):
+                if state._add_constraint(span):
+                    state.span_constraints.add(span)
+                    spans_this_turn.append(span)
+            if spans_this_turn:
+                source = "span"
+                # Induction is attempted but almost always declined here: the
+                # probe returns sub-spans, and _induce_template requires the
+                # span to be the whole trailing clause with a pure-prose
+                # prefix. Single-value colon-free paraphrases are the only
+                # ones that qualify.
+                if len(spans_this_turn) == 1 and ";" not in message:
+                    self._induce_template(message, spans_this_turn[0])
+
+        # Guarded LLM reply-interpreter (DEV_TASKS Step 4). Fires only when
+        # LLM_EXTRACT is on AND the span probe found nothing this turn AND we
+        # are under the per-session / per-run call budgets. Default off, and
+        # never reached on the public set (the ladder never runs there).
+        if (
+            LLM_EXTRACT
+            and not spans_this_turn
+            and self._llm_budget_ok(state)
+        ):
+            state.llm_calls += 1
+            self._llm_total_calls += 1
+            started = time.monotonic()
+            phrases, u = self._llm_extract(message, state.last_asked)
+            self._llm_wall_seconds += time.monotonic() - started
+            usage["prompt_tokens"] += u.get("prompt_tokens", 0)
+            usage["completion_tokens"] += u.get("completion_tokens", 0)
+            for phrase in phrases:
+                if state._add_constraint(phrase):
+                    state.llm_constraints.add(phrase)
+                    source = "llm"
+                    self._induce_template(message, phrase)
+
+        # Token-residue backstop (CLAUDE_CODE_PLAN §5.3): the private simulator
+        # may reword its templates. Keep the token residue as a low-confidence
+        # constraint so the agent still accumulates signal even when the span
+        # probe missed. Regex parsing degrades, it does not collapse.
+        residue = " ".join(_terms(message)[:12])
+        state._add_constraint(residue)
+
+        # record_message ran with gained=False; undo its info-free penalty
+        # only if a rung actually recovered something (a reworded dead-end
+        # that slips past _is_dead_end_reply yields no span and an all-stopword
+        # residue -> nothing admitted -> asks_without_gain still climbs).
+        if len(state.constraints) > before:
+            self._note_admitted(state, message, source)
+        return usage
+
+    def _note_admitted(self, state: SessionState, message: str, source: str) -> None:
+        """Common bookkeeping when a non-template rung admits a phrase --
+        record_message ran with gained=False, so undo its info-free penalty."""
+        state.parse_source = source
+        if state.last_asked:
+            state.disclosed[state.last_asked] = message
+        state.asks_without_gain = 0
+        state.disclosed_count = max(state.disclosed_count, len(state.constraints))
+
+    def _verbatim_spans(self, message: str, max_spans: int = 2) -> list[str]:
+        """Longest-first contiguous token spans of the raw reply that (a)
+        contain a non-stopword token, (b) FTS5 phrase-match >=1 document and
+        (c) match <= SPAN_DF_CAP documents. Up to max_spans (the simulator
+        discloses up to two constraints per reply). Never raises."""
+        try:
+            tokens = [t.lower() for t in TOKEN_RE.findall(message)]
+            if len(tokens) < 2:
+                return []
+            used = [False] * len(tokens)
+            probes = 0
+            accepted: list[str] = []
+            for _ in range(max_spans):
+                span, probes = self._best_span(tokens, used, probes)
+                if span is None:
+                    break
+                i, j, phrase = span
+                for k in range(i, j):
+                    used[k] = True
+                accepted.append(phrase)
+            return accepted
+        except sqlite3.Error:
+            return []
+
+    def _best_span(
+        self, tokens: list[str], used: list[bool], probes: int,
+    ) -> tuple[tuple[int, int, str] | None, int]:
+        """Longest length first; within a length, the *most discriminative*
+        (lowest doc-frequency) passing span, not merely the leftmost -- a
+        real constraint value is rarer than the wrapper prose around it."""
+        n = len(tokens)
+        for length in range(min(n, 8), 1, -1):
+            best: tuple[int, int, int, str] | None = None  # (df, i, j, phrase)
+            for i in range(0, n - length + 1):
+                j = i + length
+                if any(used[k] for k in range(i, j)):
+                    continue
+                window = tokens[i:j]
+                if not any(w not in STOPWORDS and len(w) > 2 for w in window):
+                    continue
+                if probes >= self.MAX_SPAN_PROBES:
+                    break
+                probes += 1
+                phrase = " ".join(window)
+                df = len(self._span_docset(phrase))
+                if 1 <= df <= self.SPAN_DF_CAP and (best is None or df < best[0]):
+                    best = (df, i, j, phrase)
+            if best is not None:
+                return (best[1], best[2], best[3]), probes
+        return None, probes
+
+    # ---- Cross-session template induction (DEV_TASKS Step 5, decision D2) --
+    #
+    # Default OFF (LLM_TEMPLATE_CACHE). When on, the FIRST time the span probe
+    # or the LLM recovers a value from an unparsed reply, we induce a reusable
+    # regex from the literal wrapper prose around it and store it on the Agent
+    # (persists across all sessions -- local_evaluator builds Agent once).
+    # Every later occurrence of that private paraphrase template is then
+    # parsed for free, turning a per-turn cost into a per-template one.
+    #
+    # Only message-LANGUAGE patterns are learned. Induction is restricted to
+    # values that are the trailing clause of the reply, so the stored prefix
+    # is wrapper prose only -- never a product / target / ground-truth string.
+    # Induced patterns are re-validated (re-extract the original; must not
+    # match any dead-end shape; literal prefix >= 3 chars) before storage.
+
+    def _apply_induced_templates(self, state: SessionState, message: str) -> bool:
+        if not (LLM_TEMPLATE_CACHE and LLM_EXTRACT) or not self._induced_templates:
+            return False
+        for entry in self._induced_templates:
+            match = entry.regex.search(message)
+            if not match:
+                continue
+            admitted = False
+            for part in match.group(1).split(";"):
+                part = part.strip(" .;,-")
+                if not (4 <= len(part) <= 120):
+                    continue
+                if not self._span_docset(" ".join(TOKEN_RE.findall(part)).lower()):
+                    continue
+                if state._add_constraint(part):
+                    state.span_constraints.add(part)
+                    admitted = True
+            if admitted:
+                entry.hits += 1
+                self._note_admitted(state, message, "induced")
+                return True
+        return False
+
+    def _induce_template(self, message: str, span: str) -> None:
+        if not (LLM_TEMPLATE_CACHE and LLM_EXTRACT):
+            return
+        msg = message.rstrip()
+        value = span.strip(" .;,-")
+        if not value or value.lower() not in msg.lower():
+            return
+        idx = msg.lower().rfind(value.lower())
+        # Only induce when the value is the trailing clause -> the stored
+        # prefix cannot contain another (target-specific) constraint value.
+        if msg[idx + len(value):].strip(" .;,"):
+            return
+        prefix = msg[:idx].rstrip()
+        tail = prefix[-48:].strip()
+        # The stored prefix must be pure wrapper PROSE -- letters/apostrophes/
+        # spaces only. This rejects every "key: value" / "cotton; ..." /
+        # "95% ..." shape where a *constraint value* fragment would leak into
+        # the cached pattern. Only message language is ever learned.
+        if not re.fullmatch(r"[A-Za-z' ]{3,60}", tail):
+            return
+        escaped = re.escape(tail)
+        pattern = escaped.replace("\\ ", r"\s+").replace(" ", r"\s+") + r"\s*(.+?)\.?\s*$"
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return
+        check = compiled.search(message)
+        if not check or check.group(1).strip(" .;,-").lower() != value.lower():
+            return  # (a) must re-extract the original span
+        if any(compiled.search(sample) for sample in _DEAD_END_SAMPLES):
+            return  # (b) must not match a dead-end / drain / boundary shape
+        for entry in self._induced_templates:
+            if entry.pattern == pattern:
+                entry.hits += 1
+                return
+        self._induced_templates.append(_InducedTemplate(compiled, pattern))
+        if len(self._induced_templates) > self.MAX_INDUCED_TEMPLATES:
+            self._induced_templates.sort(key=lambda e: -e.hits)  # evict LFU
+            del self._induced_templates[self.MAX_INDUCED_TEMPLATES:]
+
+    def _span_docset(self, phrase: str) -> frozenset[str]:
+        """The parent_asins whose *structured* fields (title / features /
+        details) contain this token-phrase verbatim -- the same
+        punctuation-insensitive FTS5 match used to accept the span, so
+        acceptance and scoring stay consistent (a raw substring test would
+        miss "solids 100 cotton..." against "Solids: 100% Cotton;..."). A
+        phrase matching more than SPAN_DF_CAP docs is not a constraint value
+        (see the class constant's derivation) -> empty set. Memoised.
+
+        Constraint values are pulled verbatim from title/features/details by
+        local_evaluator.intent_card(); conversational wrapper prose is not,
+        so most wrapper spans resolve to a handful of unrelated docs and
+        spray a negligible bonus off-pool rather than lifting the target."""
+        cached = self._span_df_cache.get(phrase)
+        if cached is not None:
+            return cached
+        try:
+            rows = self.connection.execute(
+                "SELECT parent_asin FROM products WHERE products MATCH ? LIMIT ?",
+                (f'{{title features details}} : "{phrase}"', self.SPAN_DF_CAP + 1),
+            ).fetchall()
+            docset: frozenset[str] = frozenset(row[0] for row in rows)
+        except sqlite3.Error:
+            docset = frozenset()
+        if len(docset) > self.SPAN_DF_CAP:
+            docset = frozenset()
+        self._span_df_cache[phrase] = docset
+        return docset
+
+    def _phrase_in_catalog(self, phrase: str) -> bool:
+        """True if the phrase occurs verbatim (token-phrase, any field) in at
+        least one catalog document -- a looser grounding check than
+        _span_docset for the high-precision colon-cue rung, where common
+        apparel values ("Zipper closure") legitimately exceed SPAN_DF_CAP.
+        Rejects hallucination / mis-extracted wrapper prose; admits real
+        values regardless of frequency."""
+        tokens = " ".join(TOKEN_RE.findall(phrase)).lower()
+        if not tokens:
+            return False
+        try:
+            row = self.connection.execute(
+                'SELECT 1 FROM products WHERE products MATCH ? LIMIT 1',
+                (f'"{tokens}"',),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
 
     # ---- Question-value estimation ------------------------------------
 
@@ -585,115 +987,128 @@ class Agent:
         # the SQL row -- self._products is the single source of truth.
         return [self._products[row[0]] for row in rows if row[0] in self._products]
 
-    # ---- Stage 2: LLM instruction sheet ---------------------------------
+    # ---- Guarded LLM reply-interpreter (DEV_TASKS Step 4, default OFF) -----
+    #
+    # The LLM instruction-sheet / rerank path was deleted in Step 1 (measured
+    # regression -- see the module docstring). What remains is a single job
+    # the deterministic ladder cannot do: recover a constraint phrase from a
+    # paraphrased reply whose wrapper the templates AND the colon-cue AND the
+    # span probe all missed. One sentence in, a JSON list of phrases out;
+    # every phrase must then pass G1-G5 before it can touch the ranking.
 
-    def _summarize_candidate(self, candidate: dict) -> str:
-        title = (candidate.get("title") or "product").strip()
-        if len(title) > 70:
-            title = title[:67].rstrip() + "..."
-        price = candidate.get("price")
-        price_text = f"${price:.2f}" if isinstance(price, float) else "price n/a"
-        categories = " ".join((candidate.get("categories") or "").split()[:6])
-        return f'"{title}" | {price_text} | {categories}'.strip()
+    LLM_INSTRUCTION = (
+        "The shopper was asked about their preferred {attr}. Their reply below "
+        "contains one or two product-attribute phrases copied verbatim from a "
+        "product listing (e.g. a material, a measurement, a feature name). "
+        "Extract only those phrases, exactly as written, as JSON "
+        '{{"phrases": ["...", "..."]}} -- no commentary, no invented text.\n'
+        "Reply: {reply}"
+    )
 
-    def _build_user_prompt(self, state: SessionState, candidates: list[dict], track: str) -> str:
-        profile = state.profile or {}
-        track_note = (
-            "Detected track: BUYING -- the customer has given something concrete; "
-            "prioritize precision and lock in hard constraints."
-            if track == "buying"
-            else "Detected track: BROWSING -- the customer is still exploring; the "
-            "candidate pool is broader by design, favor a clarifying question "
-            "unless one option is clearly strongest."
-        )
-        lines = [
-            f"Turn {state.turn} of {self.MAX_TURNS}.",
-            track_note,
-            "Customer profile: "
-            f"purchase_frequency={profile.get('purchase_frequency', 'unknown')}, "
-            f"rating_style={profile.get('rating_style', 'unknown')}, "
-            f"preference_tags={profile.get('preference_tags', [])}, "
-            f'summary="{profile.get("summary", "")}"',
-            "",
-            "Conversation so far:",
-        ]
-        for index, customer_message in enumerate(state.messages):
-            lines.append(f'{index + 1}. Customer: "{customer_message}"')
-            if index < len(state.agent_messages):
-                asked = state.ask_log[index] if index < len(state.ask_log) else None
-                suffix = f" (asked: {asked})" if asked else ""
-                lines.append(f'   Agent: "{state.agent_messages[index]}"{suffix}')
-        lines.append("")
-        lines.append(
-            "Known constraints so far: " + (json.dumps(state.disclosed) if state.disclosed else "none yet")
-        )
-        if state.declined:
-            lines.append(
-                "Customer has NO preference for these -- do not ask again: "
-                + ", ".join(sorted(state.declined))
-            )
-        lines.append("")
-        sample = candidates[: self.CANDIDATE_SAMPLE_SIZE]
-        lines.append(f"Sample of currently-matching products ({len(candidates)} total, showing {len(sample)}):")
-        for candidate in sample:
-            lines.append(f"- {self._summarize_candidate(candidate)}")
-        lines.append("")
-        lines.append("Return the JSON instruction sheet now.")
-        return "\n".join(lines)
-
-    def _call_ollama(self, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0.2, "num_ctx": 4096},
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            }
-        ).encode("utf-8")
+    def _ollama_generate(self, prompt: str) -> tuple[str, dict]:
+        """POST /api/generate (single string prompt, no chat template -- ~20
+        fewer tokens/call). Returns (response_text, usage)."""
+        payload = json.dumps({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0, "num_predict": 64, "num_ctx": 1024},
+        }).encode("utf-8")
         request = urllib.request.Request(
-            f"{self.ollama_host}/api/chat",
+            f"{self.ollama_host}/api/generate",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=self.llm_timeout) as response:
+        with urllib.request.urlopen(request, timeout=self.extract_timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
-        content = body.get("message", {}).get("content", "")
         usage = {
             "prompt_tokens": max(0, int(body.get("prompt_eval_count") or 0)),
             "completion_tokens": max(0, int(body.get("eval_count") or 0)),
         }
-        return content, usage
+        return body.get("response", ""), usage
 
-    def _get_instruction_sheet(self, state: SessionState, candidates: list[dict], track: str) -> InstructionSheet:
-        # LLM reranking is opt-in. When off, skip prompt building and the
-        # socket entirely -- zero network calls, zero tokens (Task 2).
-        if not LLM_RERANK or self._llm_disabled:
-            return InstructionSheet.fallback()
-        # Feasibility cap (Section 5.7): 800 private sessions x several turns
-        # is thousands of sequential Ollama calls. Spend the budget on the
-        # turns most likely to matter -- once constraints exist and the pool
-        # has stabilised -- and never exceed a few calls per session.
-        if state.llm_calls >= self.MAX_LLM_CALLS_PER_SESSION:
-            return InstructionSheet.fallback()
-        state.llm_calls += 1
-        user_prompt = self._build_user_prompt(state, candidates, track)
+    def _llm_phrases(self, message: str, asked_attribute: str | None) -> tuple[list[str], dict]:
+        """One Ollama call + guardrails G1 (verbatim substring of the reply)
+        and G2 (length 4..120). Returns (phrases, usage). Never raises; on any
+        failure returns ([], zero-usage) and trips the failure latch."""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         try:
-            content, usage = self._call_ollama(SYSTEM_PROMPT, user_prompt)
-            sheet = InstructionSheet.parse(content)
-            sheet.usage = usage
-            self._llm_failures = 0
-            return sheet
+            prompt = self.LLM_INSTRUCTION.format(
+                attr=asked_attribute or "needs", reply=message.strip()[:400]
+            )
+            raw, usage = self._ollama_generate(prompt)
+            data = json.loads(raw)
+            raw_phrases = data.get("phrases", []) if isinstance(data, dict) else []
+            if not isinstance(raw_phrases, list):
+                return [], usage
+            lowered_reply = message.lower()
+            out: list[str] = []
+            for item in raw_phrases[:8]:
+                if not isinstance(item, str):
+                    continue
+                phrase = item.strip(" .;,-")
+                if not (4 <= len(phrase) <= 120):          # G2
+                    continue
+                if phrase.lower() not in lowered_reply:     # G1
+                    continue
+                if phrase not in out:
+                    out.append(phrase)
+            return out, usage
         except Exception:
             self._llm_failures += 1
             if self._llm_failures >= self.LLM_FAILURE_THRESHOLD:
                 self._llm_disabled = True
-            return InstructionSheet.fallback()
+            return [], usage
 
-    # ---- Stage 3: deterministic execution -------------------------------
+    def _llm_extract(self, message: str, asked_attribute: str | None) -> tuple[list[str], dict]:
+        """G1/G2 (via _llm_phrases) + G3 (catalog-grounded through the same
+        FTS5 / SPAN_DF_CAP check as the span probe) + G4 (<= 2 admitted)."""
+        phrases, usage = self._llm_phrases(message, asked_attribute)
+        grounded = [
+            p for p in phrases
+            if self._span_docset(" ".join(TOKEN_RE.findall(p)).lower())
+        ][:2]
+        return grounded, usage
+
+    def _llm_budget_ok(self, state: SessionState) -> bool:
+        return (
+            not self._llm_disabled
+            and state.llm_calls < self.MAX_LLM_CALLS_PER_SESSION
+            and self._llm_total_calls < self.MAX_LLM_CALLS_TOTAL
+        )
+
+    def _recover_category(self, state: SessionState, message: str, usage: dict) -> None:
+        """DEV_TASKS Step 6. Same call shape and G1/G2 guardrails as the reply
+        interpreter, but NO doc-frequency cap (a category phrase is *meant* to
+        be common) -- instead the phrase must return a non-empty FTS5 result
+        before it is adopted as state.category."""
+        state.llm_calls += 1
+        self._llm_total_calls += 1
+        started = time.monotonic()
+        phrases, u = self._llm_phrases(message, "category")
+        self._llm_wall_seconds += time.monotonic() - started
+        usage["prompt_tokens"] += u.get("prompt_tokens", 0)
+        usage["completion_tokens"] += u.get("completion_tokens", 0)
+        for phrase in phrases:
+            if self._fts_has_any(phrase):
+                state.category = phrase.strip()
+                return
+
+    def _fts_has_any(self, phrase: str) -> bool:
+        terms = list(dict.fromkeys(_terms(phrase)))
+        if not terms:
+            return False
+        expression = " OR ".join(f'"{term}"' for term in terms)
+        try:
+            row = self.connection.execute(
+                "SELECT 1 FROM products WHERE products MATCH ? LIMIT 1", (expression,)
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+
+    # ---- Deterministic execution: exact-phrase scoring -----------------
 
     # Verbatim phrase-hit bonus -- dominant over token overlap (<=1.2) and
     # category terms (0.6 each). The override value is hard_constraints[0],
@@ -701,17 +1116,48 @@ class Agent:
     PHRASE_BONUS = 3.0
     OVERRIDE_PHRASE_BONUS = 4.5
 
-    def _score_candidates(
-        self, state: SessionState, candidates: list[dict], sheet: InstructionSheet
-    ) -> list[str]:
-        """Exact-phrase constraint scoring (Section 5.3). Every disclosed
-        constraint is a literal substring of the target document, so verbatim
-        containment is the dominant signal; partial token overlap and the
-        coarse category are weaker additive terms. The LLM instruction sheet
-        (only populated when LLM_RERANK=1) sits on top as a capped layer and
-        can never outweigh a verbatim phrase hit."""
-        phrases = [c.lower() for c in state.constraints if 4 <= len(c) <= 120]
+    def _phrase_overlap(self, phrase: str, doc: str) -> float:
+        """Fractional token overlap of a phrase against a doc, 0..1.2."""
+        tokens = _terms(phrase)
+        if not tokens:
+            return 0.0
+        return 1.2 * sum(token in doc for token in tokens) / len(tokens)
+
+    def _score_candidates(self, state: SessionState, candidates: list[dict]) -> list[str]:
+        """Exact-phrase constraint scoring (CLAUDE_CODE_PLAN §5.3). Every
+        disclosed constraint is a literal substring of the target document, so
+        verbatim containment is the dominant signal; partial token overlap and
+        the coarse category are weaker additive terms.
+
+        Provenance layers, from strongest to weakest:
+          - template/regex phrases: raw verbatim substring -> PHRASE_BONUS
+            (OVERRIDE_PHRASE_BONUS for the override value), else token overlap.
+            UNCLAMPED -- this is the trusted layer.
+          - span phrases (Step 2) + LLM phrases (Step 4): doc-set membership
+            (the same punctuation-insensitive FTS5 match that accepted them)
+            -> SPAN_BONUS / LLM_BONUS, else token overlap. Each provenance
+            accumulates into its own running total, then that total is CLAMPED
+            (SPAN_EVIDENCE_CAP / LLM_EVIDENCE_CAP). SPAN_EVIDENCE_CAP +
+            LLM_EVIDENCE_CAP = 2.9 < PHRASE_BONUS, so a single verbatim
+            template hit always outweighs the entire span+LLM layer -- the
+            public_0018 demotion (unbounded evidence sum, incl. an
+            unclamped token-overlap tail) is structurally impossible.
+        """
         override_phrase = state.override_value.lower() if state.override_value else None
+        template_phrases = [
+            c.lower() for c in state.constraints
+            if 4 <= len(c) <= 120
+            and c not in state.span_constraints and c not in state.llm_constraints
+        ]
+        # (phrase_lower, matching_asin_set) for each span / LLM phrase.
+        span_phrases = [
+            (c.lower(), self._span_docset(" ".join(TOKEN_RE.findall(c)).lower()))
+            for c in state.span_constraints if 4 <= len(c) <= 120
+        ]
+        llm_phrases = [
+            (c.lower(), self._span_docset(" ".join(TOKEN_RE.findall(c)).lower()))
+            for c in state.llm_constraints if 4 <= len(c) <= 120
+        ]
         category_terms = _terms(state.category)
 
         scored: list[tuple[float, int, str]] = []
@@ -726,7 +1172,7 @@ class Agent:
             # Preserve BM25 order as a tiebreak (small, negative-by-rank).
             score = -rank * 0.001
 
-            for phrase in phrases:
+            for phrase in template_phrases:
                 if phrase in doc:
                     score += (
                         self.OVERRIDE_PHRASE_BONUS
@@ -734,23 +1180,28 @@ class Agent:
                         else self.PHRASE_BONUS
                     )
                 else:
-                    tokens = _terms(phrase)
-                    if tokens:
-                        score += 1.2 * sum(token in doc for token in tokens) / len(tokens)
+                    score += self._phrase_overlap(phrase, doc)
+
+            # Span layer: doc-set hit -> SPAN_BONUS, else token overlap; the
+            # WHOLE layer's contribution is then clamped.
+            span_evidence = sum(
+                self.SPAN_BONUS if parent_asin in docset
+                else self._phrase_overlap(phrase, doc)
+                for phrase, docset in span_phrases
+            )
+            score += min(span_evidence, self.SPAN_EVIDENCE_CAP)
+
+            # LLM layer: identical shape, its own independent clamp (Step 4 G5).
+            llm_evidence = sum(
+                self.LLM_BONUS if parent_asin in docset
+                else self._phrase_overlap(phrase, doc)
+                for phrase, docset in llm_phrases
+            )
+            score += min(llm_evidence, self.LLM_EVIDENCE_CAP)
 
             for term in category_terms:
                 if term in doc:
                     score += 0.6
-
-            for attribute, value in sheet.constraints.items():
-                weight = sheet.weights.get(attribute, 0.5)
-                if attribute == "budget":
-                    budget_max = _as_float(value)
-                    price = candidate.get("price")
-                    if budget_max is not None and price is not None and price <= budget_max:
-                        score += weight
-                elif value.lower() in doc:
-                    score += weight
 
             scored.append((score, rank, parent_asin))
 
@@ -782,13 +1233,15 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         state = self._sessions[session_id]
 
-        # Everything below touches retrieval/scoring/LLM logic that we own;
-        # the LLM call already catches its own failures, but this is a last
-        # line of defense so a stray bug in our code still returns a valid,
-        # contract-shaped response instead of raising and counting the turn
-        # (or the whole session) as a hard miss.
+        # Everything below is deterministic retrieval/scoring logic that we
+        # own. This blanket handler is a last line of defense so a stray bug
+        # still returns a valid, contract-shaped response instead of raising
+        # and counting the turn (or the whole session) as a hard miss.
         try:
-            state.record_message(user_message, turn)
+            # _ingest runs state.record_message then, only for a reply the
+            # regex templates missed, the paraphrase repair ladder. Returns
+            # token usage (all-zero unless the Step 4 LLM rung fired).
+            usage = self._ingest(state, user_message, turn)
 
             track = self._route_intent(state, user_message)
             candidates = self._retrieve_candidates(state, track)
@@ -808,33 +1261,31 @@ class Agent:
                     "message": message,
                     "ask_attribute": ask_attribute,
                     "recommendations": [{"parent_asin": pid} for pid in ranked_ids],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                    "usage": usage,
                 }
 
-            sheet = self._get_instruction_sheet(state, candidates, track)
             ranked_ids = self._guaranteed_ten(
-                state, self._score_candidates(state, candidates, sheet)[:top_k]
+                state, self._score_candidates(state, candidates)[:top_k]
             )
             state.last_ranked = ranked_ids
 
             # The clarifying question is chosen by the deterministic
-            # question-value estimator, never by the LLM: Section 4.3 shows a
-            # well-reasoned semantic attribute scores *worse* than "other"
-            # against this simulator. sheet.ask_attribute is deliberately
-            # ignored here. _select_ask_attribute already excludes declined
-            # and exhausted attributes.
+            # question-value estimator: CLAUDE_CODE_PLAN §4.3 shows a well-reasoned
+            # semantic attribute scores *worse* than "other" against this
+            # simulator. _select_ask_attribute already excludes declined and
+            # exhausted attributes.
             ask_attribute = self._select_ask_attribute(state)
             if ask_attribute:
                 message = "Could you tell me a bit more about what matters here?"
             else:
-                message = sheet.message or "Here are the closest matches I found."
+                message = "Here are the closest matches I found."
 
             state.record_turn_result(ask_attribute, message)
             return {
                 "message": message,
                 "ask_attribute": ask_attribute,
                 "recommendations": [{"parent_asin": pid} for pid in ranked_ids],
-                "usage": sheet.usage,
+                "usage": usage,
             }
         except Exception:
             # Last line of defence. self._fallback_ids is precomputed in
