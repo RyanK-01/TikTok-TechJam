@@ -3,8 +3,15 @@ __pycache__/
 .DS_Store
 .env
 results.json
+results_*.json
+data/dev_slice.jsonl
 data/catalog.jsonl
 data/releases/
+# Orphaned dense-retrieval artifacts from an abandoned experiment (a
+# different branch's embedding-based retrieval attempt). Unused by the
+# current agent -- it does not import numpy or read these files.
+data/embeddings.npy
+data/embeddings_ids.json
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
 secure/
@@ -16,3 +23,7 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+
+# Paraphrase stress harness -- local testing only, never submitted.
+evaluator/eval_paraphrase.py
+evaluator/eval_paraphrase_holdout.py
