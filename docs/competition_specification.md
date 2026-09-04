@@ -16,7 +16,13 @@ Out of scope: catalog modification, identifiers outside the frozen catalog, priv
 
 The frozen `Clothing_Shoes_and_Jewelry` catalog contains 50,000 products. Participant-visible fields are `parent_asin`, `title`, `features`, `description`, `price`, `categories`, `details`, `average_rating`, `rating_number`, and `store`. Only `parent_asin` is scored.
 
-The public set has 200 labeled development sessions. The organizer keeps 800 additional sessions unreleased until the Devpost submission deadline. After the deadline, the final evaluation package will be released and teams will run the unmodified official evaluator in their own environments using their frozen submitted commit. During evaluation, intent cards and ground truth remain evaluator inputs and are never sent to the participant Agent.
+The public set has 200 labeled development sessions. The organizer keeps 800
+additional sessions private for final evaluation and will not release them to
+participants. The review committee will run each team's frozen submitted
+repository under the same environment and evaluation conditions. During
+evaluation, intent cards and ground truth remain evaluator inputs and are never
+sent to the participant Agent. This policy supersedes the previously announced
+plan to release the final evaluation package after the submission deadline.
 
 Direct user identifiers, purchase timestamps, free-text reviews, and raw purchase histories have been removed. The Agent sees only a safe aggregate `user_profile` with purchase-frequency and rating summaries plus controlled preference tags.
 
@@ -90,7 +96,14 @@ The same metrics are reported separately for Buying, Browsing, Intent Override, 
 
 ## Model and API Policy
 
-LLM usage is optional. Teams may use a legally accessible external LLM API, a local model, or a non-LLM approach. Teams run the final evaluation in their own environments, so network access and external API calls are allowed. Teams choose and manage their own credentials, usage limits, service availability, and costs. API keys must be passed through environment variables and never committed. Teams disclose model choice, approximate cost, token usage, latency, network dependencies, and any fallback behavior. The organizer does not issue a common API key, and an offline fallback is not mandatory.
+LLM usage is optional. Teams may use a legally accessible external LLM API, a
+local model, or a non-LLM approach. Every dependency must be documented and
+reproducible in the organizer-run evaluation environment. Teams choose and manage
+their own credentials, usage limits, service availability, and costs. API keys
+must be passed through environment variables and never committed. Teams disclose
+model choice, approximate cost, token usage, latency, network dependencies, and
+any fallback behavior. The organizer does not issue a common API key, and an
+offline fallback is not mandatory.
 
 See `final_evaluation_faq.md` for the complete final evaluation policy.
 

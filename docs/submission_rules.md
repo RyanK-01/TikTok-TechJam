@@ -56,9 +56,10 @@ Do not include:
 Teams may use any legally accessible LLM API, local model, or non-LLM approach.
 LLM usage is optional.
 
-The final evaluation package will be released after the Devpost submission
-deadline, and teams will run the unmodified official evaluator in their own
-environments. Network access and external API calls are allowed. Teams must:
+The 800 final test samples will remain private. The review committee will run
+each team's frozen submitted repository under uniform evaluation conditions.
+Network access and external API calls are allowed when they are fully documented
+and reproducible in the evaluation environment. Teams must:
 
 - manage their own credentials, usage limits, service availability, and costs
 - pass API keys through environment variables and never commit secret values
@@ -94,15 +95,12 @@ the organizer may treat the run as invalid.
 
 - The repository commit submitted by the Devpost deadline is the frozen version
   of the solution.
-- After the final evaluation package is released, teams must not modify their
-  Agent, prompts, indexes, model configuration, or other solution components.
-- Teams must run the unmodified official evaluator against the released final
-  package using the frozen submitted commit.
-- Teams must retain the generated `results.json`, including per-session results,
-  together with the submitted commit hash and relevant environment and execution
-  details.
-- The organizer may request logs or other supporting evidence to review the
-  reported results.
+- The review committee will evaluate that frozen commit; later changes will not
+  be included in the final run.
+- The organizer will run the same official evaluator under the same evaluation
+  conditions for every submission.
+- The final test samples, labels, and per-session evaluation data will not be
+  distributed to participants.
 
 ## Recommended File Layout
 
@@ -116,9 +114,7 @@ submission/
 
 ## Final Notes
 
-- There is no standardized organizer-provided CPU, RAM, GPU, startup-time, or
-  per-response limit because teams run the final evaluation in their own
-  environments.
-- Final results must be generated using the unmodified released evaluator. The
-  current evaluator does not impose a separate explicit per-response timeout.
+- The review committee will apply uniform evaluation conditions across all teams.
+- Final results will be generated with the official evaluator against the private
+  final test set.
 - See `docs/final_evaluation_faq.md` for the complete final evaluation policy.

@@ -5,19 +5,20 @@ the TechJam Conversational E-Commerce Search Challenge.
 
 ## 1. Final Evaluation Process
 
-The 800 final evaluation sessions will be released after the Devpost submission
-deadline. Teams will run the unmodified official evaluator in their own
-environments using the repository commit submitted before the deadline.
+The 800 final evaluation sessions will remain private and will not be released to
+participants. This policy supersedes the previously announced plan to distribute
+the final evaluation package after the Devpost submission deadline.
+
+The review committee will run each team's submitted repository under the same
+environment and evaluation conditions.
 
 - The submitted Git commit is the frozen version of the solution.
-- After the final evaluation package is released, teams must not modify their
-  Agent, prompts, indexes, model configuration, or other solution components.
-- Teams must use the unmodified official evaluator.
-- Teams must retain the generated `results.json`, including per-session results,
-  together with the submitted commit hash and relevant environment and execution
-  details.
-- The organizer may request logs or other supporting evidence to review reported
-  results.
+- The review committee will evaluate that frozen commit; later changes will not
+  be included in the final run.
+- The organizer will use the same official evaluator and evaluation conditions
+  for every submission.
+- Final test inputs, intent cards, ground-truth labels, and per-session evaluation
+  data will remain private.
 
 The final evaluation uses the same input schema, Agent interface, metric formula,
 stopping rule, invalid-output handling, deterministic customer-message templates,
@@ -30,7 +31,9 @@ LLM usage is optional. Teams may use an external API, a local model, or a non-LL
 approach. LLM semantic ranking is an allowed technical direction, not a mandatory
 requirement.
 
-Because teams run the final evaluation in their own environments:
+Submissions may use an external API, a local model, or a non-LLM approach, but
+every required dependency must be fully documented so the review committee can
+reproduce the submission. Teams must:
 
 - network access and external API calls are allowed
 - teams manage their own credentials, usage limits, service availability, and
@@ -48,14 +51,9 @@ credits.
 
 ## 3. Hardware, Runtime, and Timeouts
 
-There is no standardized organizer-provided CPU, RAM, GPU, MPS, startup-time, or
-per-response limit because teams run the final evaluation in their own
-environments.
-
 Teams should disclose the Python version, hardware, dependencies, runtime,
 latency, token usage, and estimated model cost used to produce their results.
-Final results must be generated using the unmodified official evaluator. The
-current evaluator does not impose a separate explicit per-response timeout.
+The review committee will apply uniform evaluation conditions across all teams.
 
 ## 4. Data, Catalog, and Derived Artifacts
 

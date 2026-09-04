@@ -2,6 +2,22 @@
 
 Build an AI shopping agent that asks useful follow-up questions and recommends the customer's hidden target product within at most 10 turns.
 
+## Important Update: Final Test Dataset
+
+To ensure a fair, consistent, and unbiased evaluation for every team, the 800
+final test samples will **not** be released to participants. This policy
+supersedes the previously announced plan to release the samples after repository
+submission.
+
+Instead, the review committee will evaluate every team's submitted repository
+under the same environment and conditions. Keeping the test data private protects
+its integrity and ensures that results remain directly comparable across all
+submissions.
+
+We sincerely apologize for any inconvenience caused by this change and appreciate
+your understanding, cooperation, and continued dedication to the competition. If
+you have any questions or concerns, please contact the competition organizers.
+
 ## What You Receive
 
 - A frozen catalog of 50,000 products from the `Clothing_Shoes_and_Jewelry` category of Amazon Reviews 2023.
@@ -9,7 +25,9 @@ Build an AI shopping agent that asks useful follow-up questions and recommends t
 - A weak BM25 starter agent and deterministic local evaluator.
 - The Agent API contract and scoring rules.
 
-The organizer keeps 800 additional sessions unreleased until the Devpost submission deadline. After the deadline, the final evaluation package will be released and teams will run the unmodified official evaluator in their own environments using their frozen submitted commit.
+The organizer keeps 800 additional sessions private for final evaluation. The
+review committee will run each team's frozen submitted repository under uniform
+evaluation conditions; the final test samples will not be distributed to teams.
 
 See [`docs/final_evaluation_faq.md`](docs/final_evaluation_faq.md) for the final evaluation, network, credentials, hardware, data, and scoring policy.
 
