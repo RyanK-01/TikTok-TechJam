@@ -44,24 +44,30 @@ You may include:
 
 Do not include:
 
-- private evaluation data
+- unreleased final evaluation data or labels
 - copied organizer-only files
 - API keys or secrets
 - code that requires privileged host access
 - code that modifies evaluator files
-- code that depends on undeclared external services for official final scoring
+- code that depends on undeclared external services
 
 ## Model Policy
 
-Teams may prototype with any legally accessible LLM API or local model during
-development.
+Teams may use any legally accessible LLM API, local model, or non-LLM approach.
+LLM usage is optional.
 
-For official final scoring, organizer policy may disable network access.
-Therefore:
+The 800 final test samples will remain private. The review committee will run
+each team's frozen submitted repository under uniform evaluation conditions.
+Network access and external API calls are allowed when they are fully documented
+and reproducible in the evaluation environment. Teams must:
 
-- your submission must clearly document whether it requires network access
-- if your system has an offline fallback, describe it
-- if your system cannot run without live credentials, say so explicitly
+- manage their own credentials, usage limits, service availability, and costs
+- pass API keys through environment variables and never commit secret values
+- document the required environment-variable names and setup instructions
+- disclose model choice, network dependencies, latency, token usage, estimated
+  cost, and any fallback behavior
+
+An offline fallback is not mandatory.
 
 ## Output Rules
 
@@ -85,6 +91,17 @@ Your submission package must contain:
 If your code cannot be reproduced from the submitted bundle and instructions,
 the organizer may treat the run as invalid.
 
+## Final Evaluation and Code Freeze
+
+- The repository commit submitted by the Devpost deadline is the frozen version
+  of the solution.
+- The review committee will evaluate that frozen commit; later changes will not
+  be included in the final run.
+- The organizer will run the same official evaluator under the same evaluation
+  conditions for every submission.
+- The final test samples, labels, and per-session evaluation data will not be
+  distributed to participants.
+
 ## Recommended File Layout
 
 ```text
@@ -97,7 +114,7 @@ submission/
 
 ## Final Notes
 
-- The organizer reserves the right to run your submission under CPU, memory,
-  timeout, and network restrictions.
-- The organizer will score only the frozen official artifacts and the output
-  produced by your submitted code in that environment.
+- The review committee will apply uniform evaluation conditions across all teams.
+- Final results will be generated with the official evaluator against the private
+  final test set.
+- See `docs/final_evaluation_faq.md` for the complete final evaluation policy.
